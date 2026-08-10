@@ -131,10 +131,32 @@ def build_model(args: argparse.Namespace, quant_type: str):
     return model_cls(**kwargs)
 
 
+def synchronize(device: str) -> None:
+    """Block until outstanding device work finishes, for accurate wall-clock timing."""
+
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif device.startswith("xpu") and hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.synchronize()
+
+
 def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path) -> list[dict]:
     """Generate audio for every prompt with `model` and save it under run_dir."""
 
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Warm up: first call pays for CUDA/XPU context init and kernel
+    # compilation, which would otherwise skew sample_000's timing.
+    print(f"[{run_dir.name}] Warming up...")
+    model.generate_audio(
+        prompts[0],
+        voice=args.voice,
+        max_new_tokens=min(32, args.max_new_tokens),
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+    )
+    synchronize(args.device)
 
     manifest = []
 
@@ -146,6 +168,7 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
         # draw the same random numbers for a fair token-level comparison.
         torch.manual_seed(args.seed + idx)
 
+        synchronize(args.device)
         start = time.perf_counter()
 
         output = model.generate_audio(
@@ -157,6 +180,7 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
             repetition_penalty=args.repetition_penalty,
         )
 
+        synchronize(args.device)
         elapsed = time.perf_counter() - start
 
         audio_path = run_dir / f"{sample_id}.wav"
