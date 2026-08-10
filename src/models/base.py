@@ -31,10 +31,21 @@ class GenerationOutput:
 
 class BaseTTS(ABC):
 
+    # Subclasses set this from their constructor and apply it in load()
+    # by calling self.quantize(self.quant_type) once self.model exists.
+    quant_type: str = "none"
+
     @abstractmethod
     def load(self) -> None:
         """Load the language model, tokenizer and codec."""
         raise NotImplementedError
+
+    def quantize(self, quant_type: str) -> None:
+        """Quantize self.model in place according to quant_type (quants/config.py)."""
+
+        from quants.quantizer import quantize_model
+
+        self.model = quantize_model(self.model, quant_type)
 
     @abstractmethod
     def prepare_input(self, text: str, **kwargs) -> dict[str, Any]:

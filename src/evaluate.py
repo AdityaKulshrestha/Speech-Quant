@@ -3,9 +3,14 @@ Core benchmark entry point.
 
 Loads a TTS model, generates codec-token audio for a set of English
 prompts, and saves the resulting waveforms plus a manifest of
-per-sample metadata. Quantization is not implemented yet; --quant-type
-is recorded in the manifest for future use but does not change the
-model that gets loaded.
+per-sample metadata.
+
+If --quant-type is "none" (default), only the full-precision baseline
+runs. If a quant flavour is given (see quants/config.py), the baseline
+and the quantized model are both run on the same prompts, and the
+generated codec-token sequences are compared using the FDP / D(t)
+metrics from METRICS.md. The comparison scores are printed and dumped
+to <output-dir>/scores_<quant-type>.json.
 """
 
 import argparse
@@ -16,9 +21,12 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
+from evaluation.metrics import compare_sequences, summarize_scores
 from models.orpheus_model import OrpheusTTS
+from quants.config import QUANT_CONFIGS
 
 SRC_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SRC_DIR.parent
 
 MODEL_REGISTRY = {
     "orpheus": OrpheusTTS,
@@ -45,11 +53,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--quant-type",
+        choices=sorted(QUANT_CONFIGS),
         default="none",
         help=(
-            "Quantization configuration to use. Not implemented yet: "
-            "recorded in the manifest only, the default full-precision "
-            "model is always loaded."
+            "Quantization flavour to compare against the full-precision "
+            "baseline (see quants/config.py). 'none' runs only the baseline."
         ),
     )
     parser.add_argument(
@@ -65,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(SRC_DIR / "outputs"),
-        help="Directory to write generated audio and the run manifest.",
+        default=str(REPO_ROOT / "outputs"),
+        help="Directory to write generated audio, manifests and scores.",
     )
     parser.add_argument(
         "--voice",
@@ -85,8 +93,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
-        help="Optional random seed for reproducible sampling.",
+        default=0,
+        help=(
+            "Random seed, reset before generating each sample so the "
+            "baseline and quantized runs draw the same random numbers."
+        ),
     )
 
     return parser.parse_args()
@@ -110,42 +121,30 @@ def load_prompts(prompts_file: str, num_samples: int) -> list[str]:
     return prompts[:num_samples]
 
 
-def build_model(args: argparse.Namespace):
-    if args.quant_type != "none":
-        print(
-            f"Warning: --quant-type={args.quant_type!r} was requested, but "
-            "quantization is not implemented yet. Loading the default "
-            "full-precision model instead."
-        )
-
+def build_model(args: argparse.Namespace, quant_type: str):
     model_cls = MODEL_REGISTRY[args.model]
 
-    kwargs = {"device": args.device}
+    kwargs = {"device": args.device, "quant_type": quant_type}
     if args.model_name:
         kwargs["model_name"] = args.model_name
 
     return model_cls(**kwargs)
 
 
-def main() -> None:
-    args = parse_args()
+def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path) -> list[dict]:
+    """Generate audio for every prompt with `model` and save it under run_dir."""
 
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-
-    prompts = load_prompts(args.prompts_file, args.num_samples)
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    model = build_model(args)
-    model.load()
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = []
 
     for idx, text in enumerate(prompts):
         sample_id = f"sample_{idx:03d}"
-        print(f"[{sample_id}] Generating: {text!r}")
+        print(f"[{run_dir.name}/{sample_id}] Generating: {text!r}")
+
+        # Reset the seed per sample so the baseline and quantized runs
+        # draw the same random numbers for a fair token-level comparison.
+        torch.manual_seed(args.seed + idx)
 
         start = time.perf_counter()
 
@@ -160,32 +159,75 @@ def main() -> None:
 
         elapsed = time.perf_counter() - start
 
-        audio_path = output_dir / f"{sample_id}.wav"
+        audio_path = run_dir / f"{sample_id}.wav"
         sf.write(str(audio_path), output.audio.float().numpy(), output.sampling_rate)
 
         manifest.append(
             {
                 "sample_id": sample_id,
                 "text": text,
-                "model": args.model,
                 "model_name": model.model_name,
-                "quant_type": args.quant_type,
+                "quant_type": model.quant_type,
                 "voice": args.voice,
                 "audio_path": str(audio_path),
                 "num_audio_tokens": output.audio_tokens.numel(),
                 "generation_seconds": elapsed,
+                "audio_tokens": output.audio_tokens.tolist(),
                 **output.metadata,
             }
         )
 
-    manifest_path = output_dir / "manifest.json"
+    manifest_path = run_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    model.unload()
+    print(f"Wrote {len(manifest)} samples to {run_dir}")
 
-    print(f"Wrote {len(manifest)} samples to {output_dir}")
-    print(f"Manifest: {manifest_path}")
+    return manifest
+
+
+def main() -> None:
+    args = parse_args()
+
+    prompts = load_prompts(args.prompts_file, args.num_samples)
+
+    output_dir = Path(args.output_dir)
+
+    baseline_model = build_model(args, quant_type="none")
+    baseline_model.load()
+    baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
+    baseline_model.unload()
+
+    if args.quant_type == "none":
+        return
+
+    quant_model = build_model(args, quant_type=args.quant_type)
+    quant_model.load()
+    quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
+    quant_model.unload()
+
+    per_sample_scores = []
+
+    for baseline_entry, quant_entry in zip(baseline_manifest, quant_manifest):
+        baseline_tokens = torch.tensor(baseline_entry["audio_tokens"])
+        quant_tokens = torch.tensor(quant_entry["audio_tokens"])
+
+        score = compare_sequences(baseline_tokens, quant_tokens)
+        score["sample_id"] = baseline_entry["sample_id"]
+        score["text"] = baseline_entry["text"]
+
+        per_sample_scores.append(score)
+
+    summary = summarize_scores(per_sample_scores)
+
+    print(f"\n=== {args.quant_type} vs baseline ===")
+    print(json.dumps(summary, indent=2))
+
+    scores_path = output_dir / f"scores_{args.quant_type}.json"
+    with open(scores_path, "w") as f:
+        json.dump({"summary": summary, "per_sample": per_sample_scores}, f, indent=2)
+
+    print(f"Scores: {scores_path}")
 
 
 if __name__ == "__main__":

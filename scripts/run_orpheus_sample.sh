@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Sample invocation of src/evaluate.py for the Orpheus baseline (default, non-quantized) model.
+# Sample invocation of src/evaluate.py: runs the Orpheus baseline and an
+# int4 (torchao) quantized variant, then compares them (FDP / D(t)).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,10 +9,10 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 python "$REPO_ROOT/src/evaluate.py" \
     --model orpheus \
     --model-name canopylabs/orpheus-3b-0.1-ft \
-    --quant-type none \
+    --quant-type int4 \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
     --num-samples 5 \
-    --output-dir "$REPO_ROOT/src/outputs/orpheus_baseline" \
+    --output-dir "$REPO_ROOT/outputs" \
     --voice tara \
     --device xpu \
     --max-new-tokens 1200 \

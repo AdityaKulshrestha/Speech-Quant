@@ -46,6 +46,7 @@ class OrpheusTTS(BaseTTS):
         snac_model_name: str = "hubertsiuzdak/snac_24khz",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        quant_type: str = "none",
     ):
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
@@ -53,6 +54,7 @@ class OrpheusTTS(BaseTTS):
 
         self.device = device
         self.dtype = dtype
+        self.quant_type = quant_type
 
         self.model = None
         self.tokenizer = None
@@ -72,6 +74,10 @@ class OrpheusTTS(BaseTTS):
         ).to(self.device)
 
         self.model.eval()
+
+        if self.quant_type != "none":
+            print(f"Quantizing language model: {self.quant_type}")
+            self.quantize(self.quant_type)
 
         print("Loading tokenizer...")
 

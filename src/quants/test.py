@@ -50,12 +50,15 @@ print("Loading model...")
 quantized_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     dtype="auto",
-    device_map="cpu",
+    device_map="auto",
     # quantization_config=quantization_config,
 )
 
 quantized_model.eval()
+# This works, hf based backend is not working
 quantize_(quantized_model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="plain_int32"))
+# quantize_(quantized_model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
+
 
 print("Model loaded.")
 
