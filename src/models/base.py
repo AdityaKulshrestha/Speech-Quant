@@ -1,0 +1,95 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import torch
+
+
+@dataclass
+class GenerationOutput:
+    """
+    Output of the autoregressive generation stage.
+
+    generated_ids:
+        Complete output from the language model, including prompt tokens.
+
+    audio_tokens:
+        Extracted neural codec tokens, before codec decoding.
+
+    audio:
+        Optional decoded waveform.
+    """
+
+    generated_ids: torch.Tensor
+    audio_tokens: torch.Tensor
+
+    audio: Optional[torch.Tensor] = None
+    sampling_rate: Optional[int] = None
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class BaseTTS(ABC):
+
+    @abstractmethod
+    def load(self) -> None:
+        """Load the language model, tokenizer and codec."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_input(self, text: str, **kwargs) -> dict[str, Any]:
+        """Convert user input into model-specific inputs."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate_tokens(
+        self,
+        inputs: dict[str, Any],
+        **generation_kwargs,
+    ) -> GenerationOutput:
+        """
+        Autoregressively generate codec tokens.
+
+        This should NOT decode the tokens into audio.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def decode_audio(
+        self,
+        audio_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        """Decode codec tokens into waveform."""
+        raise NotImplementedError
+
+    def generate_audio(
+        self,
+        text: str,
+        **kwargs,
+    ) -> GenerationOutput:
+
+        inputs = self.prepare_input(text, **kwargs)
+
+        output = self.generate_tokens(
+            inputs,
+            **kwargs,
+        )
+
+        audio, sampling_rate = self.decode_audio(
+            output.audio_tokens
+        )
+
+        output.audio = audio
+        output.sampling_rate = sampling_rate
+
+        return output
+
+    def unload(self) -> None:
+        """Release model resources."""
+
+        for attr in ("model", "tokenizer", "codec"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
