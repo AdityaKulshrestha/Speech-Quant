@@ -9,7 +9,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 python "$REPO_ROOT/src/evaluate.py" \
     --model orpheus \
     --model-name canopylabs/orpheus-3b-0.1-ft \
-    --quant-type int4 \
+    --quant-type gptq-4bit \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
     --num-samples 5 \
     --output-dir "$REPO_ROOT/outputs" \
