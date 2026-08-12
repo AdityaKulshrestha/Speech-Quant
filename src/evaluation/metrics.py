@@ -3,9 +3,49 @@ Token-divergence metrics from METRICS.md: First Divergence Position (FDP)
 and Cumulative Divergence Rate (D(t)), comparing a quantized model's
 generated codec tokens against the full-precision baseline for the same
 prompt.
+
+Extended metrics:
+  - codebook_ids_for_tokens: maps flat token positions to SNAC codebook (0/1/2)
+  - probability_difference: per-position baseline_prob - quant_prob for chosen token
+  - kl_divergence_sequence: per-position KL(P_baseline || P_quant) over audio subspace
 """
 
 import torch
+
+# Orpheus 7-token frame layout: [L1, L2, L3, L3, L2, L3, L3]
+_FRAME_CODEBOOK = [0, 1, 2, 2, 1, 2, 2]
+
+
+def codebook_ids_for_tokens(num_tokens: int) -> list[int]:
+    """Codebook index (0=L1/coarsest, 1=L2, 2=L3/finest) for each flat token position."""
+    return [_FRAME_CODEBOOK[t % 7] for t in range(num_tokens)]
+
+
+def probability_difference(
+    baseline_probs: torch.Tensor,
+    quant_probs: torch.Tensor,
+    baseline_offsets: torch.Tensor,
+) -> list[float]:
+    """Per-position (p_baseline - p_quant) for the token chosen by the baseline model."""
+    n = min(len(baseline_probs), len(quant_probs), len(baseline_offsets))
+    diffs = []
+    for i in range(n):
+        idx = int(baseline_offsets[i].item())
+        diffs.append(float(baseline_probs[i, idx].item()) - float(quant_probs[i, idx].item()))
+    return diffs
+
+
+def kl_divergence_sequence(
+    baseline_probs: torch.Tensor,
+    quant_probs: torch.Tensor,
+    eps: float = 1e-8,
+) -> list[float]:
+    """Per-position KL(P_baseline || P_quant) over the audio token subspace."""
+    n = min(len(baseline_probs), len(quant_probs))
+    p = baseline_probs[:n].float().clamp(min=eps)
+    q = quant_probs[:n].float().clamp(min=eps)
+    return (p * (p / q).log()).sum(dim=-1).tolist()
+
 
 
 def first_divergence_position(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor) -> int | None:
@@ -51,14 +91,18 @@ def compare_sequences(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor)
 
 
 def summarize_scores(per_sample: list[dict]) -> dict:
-    """Aggregate FDP/D(t) across samples for the final printed/dumped score."""
+    """Aggregate FDP/D(t)/prob-diff/KL across samples for the final score block."""
 
     fdps = [s["first_divergence_position"] for s in per_sample if s["first_divergence_position"] is not None]
     finals = [s["final_divergence_rate"] for s in per_sample if s["final_divergence_rate"] is not None]
+    mean_pdiffs = [s["mean_prob_difference"] for s in per_sample if s.get("mean_prob_difference") is not None]
+    mean_kls = [s["mean_kl_divergence"] for s in per_sample if s.get("mean_kl_divergence") is not None]
 
     return {
         "num_samples": len(per_sample),
         "num_samples_with_divergence": len(fdps),
         "mean_first_divergence_position": sum(fdps) / len(fdps) if fdps else None,
         "mean_final_divergence_rate": sum(finals) / len(finals) if finals else 0.0,
+        "mean_prob_difference": sum(mean_pdiffs) / len(mean_pdiffs) if mean_pdiffs else None,
+        "mean_kl_divergence": sum(mean_kls) / len(mean_kls) if mean_kls else None,
     }

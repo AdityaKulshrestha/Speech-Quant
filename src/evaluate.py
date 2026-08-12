@@ -18,13 +18,24 @@ import json
 import time
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 import torch
 
-from evaluation.metrics import compare_sequences, summarize_scores
+from evaluation.metrics import (
+    codebook_ids_for_tokens,
+    compare_sequences,
+    kl_divergence_sequence,
+    probability_difference,
+    summarize_scores,
+)
 from models.orpheus_model import OrpheusTTS
 from quants.config import QUANT_CONFIGS
-from visualization.heatmap import save_token_heatmap
+from visualization.heatmap import (
+    save_codebook_heatmap,
+    save_prob_diff_heatmap,
+    save_token_heatmap,
+)
 
 SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SRC_DIR.parent
@@ -187,6 +198,24 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
         audio_path = run_dir / f"{sample_id}.wav"
         sf.write(str(audio_path), output.audio.float().numpy(), output.sampling_rate)
 
+        # Codebook IDs and per-token probabilities
+        num_tok = output.audio_tokens.numel()
+        cb_ids = codebook_ids_for_tokens(num_tok)
+
+        audio_probs_path = None
+        token_probs: list[float] = []
+        audio_token_start = getattr(model, "AUDIO_TOKEN_START", None)
+
+        if output.audio_logits is not None and audio_token_start is not None:
+            offsets = (output.audio_tokens - audio_token_start).cpu().long()
+            n = min(len(output.audio_logits), len(offsets))
+            token_probs = [
+                float(output.audio_logits[i, int(offsets[i].item())].item())
+                for i in range(n)
+            ]
+            audio_probs_path = run_dir / f"{sample_id}_audio_probs.npy"
+            np.save(str(audio_probs_path), output.audio_logits.numpy())
+
         manifest.append(
             {
                 "sample_id": sample_id,
@@ -195,9 +224,13 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
                 "quant_type": model.quant_type,
                 "voice": args.voice,
                 "audio_path": str(audio_path),
-                "num_audio_tokens": output.audio_tokens.numel(),
+                "num_audio_tokens": num_tok,
                 "generation_seconds": elapsed,
                 "audio_tokens": output.audio_tokens.tolist(),
+                "codebook_ids": cb_ids,
+                "token_probs": token_probs,
+                "audio_token_start": audio_token_start,
+                "audio_probs_path": str(audio_probs_path) if audio_probs_path else None,
                 **output.metadata,
             }
         )
@@ -241,6 +274,24 @@ def main() -> None:
         score["sample_id"] = baseline_entry["sample_id"]
         score["text"] = baseline_entry["text"]
 
+        # Probability difference and KL divergence
+        b_path = baseline_entry.get("audio_probs_path")
+        q_path = quant_entry.get("audio_probs_path")
+        ats = baseline_entry.get("audio_token_start")
+
+        if b_path and q_path and ats is not None:
+            b_probs = torch.from_numpy(np.load(b_path))
+            q_probs = torch.from_numpy(np.load(q_path))
+            offsets = (baseline_tokens - ats).long()
+
+            pdiff = probability_difference(b_probs, q_probs, offsets)
+            kl_vals = kl_divergence_sequence(b_probs, q_probs)
+
+            score["prob_difference"] = pdiff
+            score["mean_prob_difference"] = sum(pdiff) / len(pdiff) if pdiff else 0.0
+            score["kl_divergence"] = kl_vals
+            score["mean_kl_divergence"] = sum(kl_vals) / len(kl_vals) if kl_vals else 0.0
+
         per_sample_scores.append(score)
 
     summary = summarize_scores(per_sample_scores)
@@ -254,8 +305,21 @@ def main() -> None:
 
     print(f"Scores: {scores_path}")
 
-    heatmap_path = output_dir / f"heatmap_{args.quant_type}.png"
-    save_token_heatmap(baseline_manifest, quant_manifest, heatmap_path)
+    analysis_dir = output_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    save_token_heatmap(
+        baseline_manifest, quant_manifest,
+        analysis_dir / f"heatmap_{args.quant_type}.png",
+    )
+    save_codebook_heatmap(
+        baseline_manifest, quant_manifest,
+        analysis_dir / f"codebook_{args.quant_type}.png",
+    )
+    save_prob_diff_heatmap(
+        per_sample_scores,
+        analysis_dir / f"prob_diff_{args.quant_type}.png",
+    )
 
 
 if __name__ == "__main__":

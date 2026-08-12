@@ -4,11 +4,27 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 
 from snac import SNAC
 
 from .base import BaseTTS, GenerationOutput
+
+
+class AudioLogitCapture(LogitsProcessor):
+    """Captures audio-subspace softmax probs at every generation step."""
+
+    def __init__(self, audio_start: int, audio_end: int):
+        self.audio_start = audio_start
+        self.audio_end = audio_end
+        self.step_probs: list[torch.Tensor] = []
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        audio_slice = scores[0, self.audio_start:self.audio_end].float()
+        self.step_probs.append(torch.softmax(audio_slice, dim=-1).cpu().half())
+        return scores
 
 
 class OrpheusTTS(BaseTTS):
@@ -171,6 +187,9 @@ class OrpheusTTS(BaseTTS):
         **kwargs,
     ) -> GenerationOutput:
 
+        audio_end = self.AUDIO_TOKEN_START + self.TOKENS_PER_FRAME * self.CODEBOOK_SIZE
+        capture = AudioLogitCapture(self.AUDIO_TOKEN_START, audio_end)
+
         generated_ids = self.model.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -181,23 +200,49 @@ class OrpheusTTS(BaseTTS):
             repetition_penalty=repetition_penalty,
             num_return_sequences=1,
             eos_token_id=self.END_OF_SPEECH,
+            logits_processor=LogitsProcessorList([capture]),
         )
 
-        audio_tokens = self.extract_audio_tokens(
-            generated_ids
+        audio_tokens = self.extract_audio_tokens(generated_ids)
+        audio_logits = self._extract_audio_logits(
+            capture.step_probs, generated_ids, inputs["input_ids"].shape[-1]
         )
 
         return GenerationOutput(
             generated_ids=generated_ids,
             audio_tokens=audio_tokens,
+            audio_logits=audio_logits,
             metadata={
-                "input_length": inputs[
-                    "input_ids"
-                ].shape[-1],
+                "input_length": inputs["input_ids"].shape[-1],
                 "generated_length": generated_ids.shape[-1],
                 "num_audio_tokens": audio_tokens.numel(),
             },
         )
+
+    def _extract_audio_logits(
+        self,
+        step_probs: list[torch.Tensor],
+        generated_ids: torch.Tensor,
+        input_len: int,
+    ) -> torch.Tensor | None:
+        """Match captured per-step probs to audio token positions."""
+        gen_tokens = generated_ids[0, input_len:]
+
+        sos_pos = (gen_tokens == self.START_OF_SPEECH).nonzero(as_tuple=True)[0]
+        start_idx = int(sos_pos[-1].item()) + 1 if len(sos_pos) > 0 else 0
+
+        audio_probs: list[torch.Tensor] = []
+        for i in range(start_idx, len(gen_tokens)):
+            tok = gen_tokens[i].item()
+            if tok == self.END_OF_SPEECH:
+                break
+            if tok >= self.AUDIO_TOKEN_START and i < len(step_probs):
+                audio_probs.append(step_probs[i])
+
+        n_complete = (len(audio_probs) // self.TOKENS_PER_FRAME) * self.TOKENS_PER_FRAME
+        if n_complete == 0:
+            return None
+        return torch.stack(audio_probs[:n_complete])
 
     # =========================================================
     # Extract Orpheus codec tokens

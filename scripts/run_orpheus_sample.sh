@@ -11,7 +11,7 @@ python "$REPO_ROOT/src/evaluate.py" \
     --model-name canopylabs/orpheus-3b-0.1-ft \
     --quant-type gptq-4bit \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
-    --num-samples 5 \
+    --num-samples 50 \
     --output-dir "$REPO_ROOT/outputs" \
     --voice tara \
     --device xpu \

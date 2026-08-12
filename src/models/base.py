@@ -25,6 +25,8 @@ class GenerationOutput:
 
     audio: Optional[torch.Tensor] = None
     sampling_rate: Optional[int] = None
+    # (num_audio_tokens, audio_vocab_size) float16 — audio-subspace softmax probs
+    audio_logits: Optional[torch.Tensor] = None
 
     metadata: dict[str, Any] = field(default_factory=dict)
 

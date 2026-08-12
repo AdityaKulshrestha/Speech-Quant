@@ -1,6 +1,10 @@
 """
 Per-token match heatmap: green = baseline and quantized token agree,
 red = they differ, light-gray = position beyond the shorter sequence.
+
+Additional charts:
+  save_codebook_heatmap  – mismatches coloured by SNAC codebook level
+  save_prob_diff_heatmap – diverging-gradient probability difference grid
 """
 
 from pathlib import Path
@@ -62,3 +66,129 @@ def save_token_heatmap(
     plt.close(fig)
 
     print(f"Heatmap: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Codebook heatmap
+# ---------------------------------------------------------------------------
+
+# Orpheus frame layout → codebook: [L1, L2, L3, L3, L2, L3, L3]
+_FRAME_CODEBOOK = [0, 1, 2, 2, 1, 2, 2]
+
+# Encoding: 0=match, 1=L1 mismatch, 2=L2 mismatch, 3=L3 mismatch, NaN=padding
+_CB_CMAP = mcolors.ListedColormap([
+    "#2ecc71",   # 0 – match (green)
+    "#c0392b",   # 1 – L1 mismatch (dark red – coarsest, most impactful)
+    "#e67e22",   # 2 – L2 mismatch (orange)
+    "#f1c40f",   # 3 – L3 mismatch (yellow – finest, least impactful)
+])
+_CB_CMAP.set_bad("whitesmoke")
+
+
+def save_codebook_heatmap(
+    baseline_manifest: List[dict],
+    quant_manifest: List[dict],
+    output_path: str | Path,
+) -> None:
+    """Mismatch heatmap coloured by SNAC codebook level (L1/L2/L3)."""
+
+    n_samples = len(baseline_manifest)
+    arrays = []
+    for b, q in zip(baseline_manifest, quant_manifest):
+        b_tok = np.array(b["audio_tokens"])
+        q_tok = np.array(q["audio_tokens"])
+        n = min(len(b_tok), len(q_tok))
+        match = b_tok[:n] == q_tok[:n]
+        row = np.zeros(n, dtype=float)
+        for pos in range(n):
+            if not match[pos]:
+                row[pos] = float(_FRAME_CODEBOOK[pos % 7] + 1)  # 1/2/3
+        arrays.append(row)
+
+    max_len = max(len(a) for a in arrays) if arrays else 1
+    matrix = np.full((n_samples, max_len), np.nan)
+    for i, arr in enumerate(arrays):
+        matrix[i, : len(arr)] = arr
+
+    masked = np.ma.masked_invalid(matrix)
+
+    fig_w = max(12, max_len / 60)
+    fig_h = max(3, n_samples * 0.7 + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.imshow(masked, aspect="auto", cmap=_CB_CMAP, vmin=0, vmax=3, interpolation="none")
+
+    sm = plt.cm.ScalarMappable(cmap=_CB_CMAP, norm=mcolors.Normalize(vmin=0, vmax=3))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, ticks=[0.375, 1.125, 1.875, 2.625], fraction=0.02, pad=0.02)
+    cbar.ax.set_yticklabels(["Match", "L1 (coarse)", "L2", "L3 (fine)"])
+
+    ax.set_xlabel("Token position")
+    ax.set_ylabel("Sample")
+    ax.set_yticks(range(n_samples))
+    ax.set_yticklabels([e["sample_id"] for e in baseline_manifest], fontsize=8)
+    ax.set_title("Codebook mismatch  ·  green=correct  ·  red→yellow = L1→L3 error")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Codebook heatmap: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Probability difference heatmap
+# ---------------------------------------------------------------------------
+
+def save_prob_diff_heatmap(
+    per_sample_scores: List[dict],
+    output_path: str | Path,
+) -> None:
+    """Diverging gradient heatmap of per-token (p_baseline - p_quant)."""
+
+    arrays = []
+    for s in per_sample_scores:
+        pdiff = s.get("prob_difference")
+        if pdiff:
+            arrays.append(np.array(pdiff, dtype=float))
+        else:
+            arrays.append(np.zeros(0))
+
+    if not any(len(a) for a in arrays):
+        print("prob_diff heatmap skipped: no probability data available.")
+        return
+
+    n_samples = len(arrays)
+    max_len = max(len(a) for a in arrays) if arrays else 1
+    matrix = np.full((n_samples, max_len), np.nan)
+    for i, arr in enumerate(arrays):
+        matrix[i, : len(arr)] = arr
+
+    masked = np.ma.masked_invalid(matrix)
+
+    # Symmetric colour scale centred at 0
+    abs_max = np.nanmax(np.abs(matrix))
+    if abs_max == 0:
+        abs_max = 1.0
+
+    cmap = plt.cm.RdBu_r
+    cmap.set_bad("whitesmoke")
+
+    fig_w = max(12, max_len / 60)
+    fig_h = max(3, n_samples * 0.7 + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(
+        masked, aspect="auto", cmap=cmap,
+        vmin=-abs_max, vmax=abs_max, interpolation="none",
+    )
+    fig.colorbar(im, ax=ax, label="p_baseline − p_quant", fraction=0.02, pad=0.02)
+
+    ax.set_xlabel("Token position")
+    ax.set_ylabel("Sample")
+    ax.set_yticks(range(n_samples))
+    labels = [s.get("sample_id", f"sample_{i}") for i, s in enumerate(per_sample_scores)]
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_title("Probability difference  ·  red = baseline more confident  ·  blue = quant more confident")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Prob-diff heatmap: {output_path}")
