@@ -10,7 +10,9 @@ dependencies = [
     "snac>=1.2.1",
     "soundfile>=0.12",
     "numpy>=1.26",
-    "torchao>=0.9",
+    "gptqmodel>=7.0",
+    "datasets>=2.0",
+    "matplotlib>=3.7",
 ]
 
 [build-system]

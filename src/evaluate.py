@@ -24,6 +24,7 @@ import torch
 from evaluation.metrics import compare_sequences, summarize_scores
 from models.orpheus_model import OrpheusTTS
 from quants.config import QUANT_CONFIGS
+from visualization.heatmap import save_token_heatmap
 
 SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SRC_DIR.parent
@@ -83,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="cuda",
+        default="xpu",
         help="Device to run inference on.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=1200)
@@ -252,6 +253,9 @@ def main() -> None:
         json.dump({"summary": summary, "per_sample": per_sample_scores}, f, indent=2)
 
     print(f"Scores: {scores_path}")
+
+    heatmap_path = output_dir / f"heatmap_{args.quant_type}.png"
+    save_token_heatmap(baseline_manifest, quant_manifest, heatmap_path)
 
 
 if __name__ == "__main__":
