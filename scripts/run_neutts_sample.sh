@@ -8,7 +8,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 python "$REPO_ROOT/src/evaluate.py" \
     --model neutts \
-    --model-name neuphonic/neutts-nano \
+    --model-name neuphonic/neutts-2e \
     --quant-type gptq-4bit \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
     --num-samples 50 \

@@ -22,8 +22,8 @@ class AudioLogitCapture(LogitsProcessor):
         self.step_probs: list[torch.Tensor] = []
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        audio_slice = scores[0, self.audio_start:self.audio_end].float()
-        self.step_probs.append(torch.softmax(audio_slice, dim=-1).cpu().half())
+        audio_slice = scores[0, self.audio_start:self.audio_end].half()
+        self.step_probs.append(audio_slice)  # stay on device; bulk .cpu() after generation
         return scores
 
 
@@ -242,7 +242,9 @@ class OrpheusTTS(BaseTTS):
         n_complete = (len(audio_probs) // self.TOKENS_PER_FRAME) * self.TOKENS_PER_FRAME
         if n_complete == 0:
             return None
-        return torch.stack(audio_probs[:n_complete])
+        # Single device→CPU transfer + softmax for all audio steps at once
+        stacked = torch.stack(audio_probs[:n_complete]).float()
+        return torch.softmax(stacked, dim=-1).cpu().half()
 
     # =========================================================
     # Extract Orpheus codec tokens

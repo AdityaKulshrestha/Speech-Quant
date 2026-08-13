@@ -7,3 +7,5 @@ test.py
 quant_models
 logs
 hf_*
+.config
+.opencode-trace

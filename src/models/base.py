@@ -88,6 +88,13 @@ class BaseTTS(ABC):
             **kwargs,
         )
 
+        if output.audio_tokens.numel() == 0:
+            raise RuntimeError(
+                f"No audio tokens generated for prompt {text!r}. "
+                "The model stopped before producing audio — try increasing "
+                "max_new_tokens or check the prompt/voice settings."
+            )
+
         audio, sampling_rate = self.decode_audio(
             output.audio_tokens
         )

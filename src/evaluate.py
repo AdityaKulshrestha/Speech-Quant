@@ -159,13 +159,13 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Warm up: first call pays for CUDA/XPU context init and kernel
-    # compilation, which would otherwise skew sample_000's timing.
+    # Warmup: 200 tokens gives enough headroom for at least one complete audio
+    # frame (7 for Orpheus, 1 for NeuTTS) without timing the full generation.
     print(f"[{run_dir.name}] Warming up...")
     model.generate_audio(
         prompts[0],
         voice=args.voice,
-        max_new_tokens=min(32, args.max_new_tokens),
+        max_new_tokens=min(200, args.max_new_tokens),
         temperature=args.temperature,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
@@ -251,9 +251,11 @@ def main() -> None:
 
     prompts = load_prompts(args.prompts_file, args.num_samples)
 
-    output_dir = Path(args.output_dir)
-
     baseline_model = build_model(args, quant_type="none")
+    # Derive output subdirectory from the model checkpoint name.
+    model_slug = Path(baseline_model.model_name).name  # e.g. "orpheus-3b-0.1-ft"
+    output_dir = Path(args.output_dir) / model_slug
+
     baseline_model.load()
     baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
     baseline_model.unload()

@@ -2,10 +2,11 @@
 NeuTTS model adapter for the Speech-Quant BaseTTS interface.
 
 Torch backbone only: no GGUF, no ONNX, no streaming, no watermarking.
-Targets BPE-format models (neutts-nano and family).
-Speaker references are loaded from the bundled NeuTTS2E sample directory.
+BPE-format models only (neutts-2e). Speaker references loaded from the
+bundled neutts package samples directory.
 """
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,7 +21,6 @@ from transformers import (
 
 from .base import BaseTTS, GenerationOutput
 
-# Bundled speaker references shipped with the neutts package.
 import neutts as _neutts_pkg
 _SAMPLE_DIR = Path(_neutts_pkg.__file__).parent / "samples"
 
@@ -34,8 +34,8 @@ class _SpeechLogitCapture(LogitsProcessor):
         self.step_probs: list[torch.Tensor] = []
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        s = scores[0, self.speech_start : self.speech_end].float()
-        self.step_probs.append(torch.softmax(s, dim=-1).cpu().half())
+        s = scores[0, self.speech_start : self.speech_end].half()
+        self.step_probs.append(s)  # stay on device; bulk .cpu() after generation
         return scores
 
 
@@ -44,7 +44,7 @@ class NeuTTSModel(BaseTTS):
     NeuTTS (torch backbone) + NeuCodec wrapped for the BaseTTS interface.
 
     AUDIO_TOKEN_START = 0: codec codes are 0-based (no offset, unlike Orpheus).
-    Speaker is selected via the `voice` kwarg (maps to bundled NeuTTS2E speakers).
+    Speaker selected via the 'voice' kwarg; maps to bundled NeuTTS2E speakers.
     """
 
     AUDIO_TOKEN_START = 0
@@ -53,7 +53,7 @@ class NeuTTSModel(BaseTTS):
 
     def __init__(
         self,
-        model_name: str = "neuphonic/neutts-nano",
+        model_name: str = "neuphonic/neutts-2e",
         codec_name: str = "neuphonic/neucodec",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
@@ -93,23 +93,37 @@ class NeuTTSModel(BaseTTS):
 
         self.model.eval()
 
+        # Reject phoneme-format models; only BPE is supported here.
+        neuphonic_cfg = getattr(self.model.config, "neuphonic", None) or {}
+        input_fmt = neuphonic_cfg.get("input_format", "phonemes")
+        if input_fmt != "BPE":
+            raise ValueError(
+                f"{self.model_name!r} uses input_format={input_fmt!r}. "
+                "NeuTTSModel only supports BPE-format models (e.g. neuphonic/neutts-2e)."
+            )
+
         print(f"Loading NeuCodec: {self.codec_name}")
         self.codec = NeuCodec.from_pretrained(self.codec_name).eval().to(self.device)
 
-        # Resolve the speech token range in the vocabulary.
+        # Resolve speech token vocabulary range.
         self._speech_start = self.tokenizer.convert_tokens_to_ids("<|speech_0|>")
-        for size in (8192, 4096, 2048, 1024):
+        # unk_token_id is None for this tokenizer, so use 'is not None' check.
+        for size in (131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024):
             last = self.tokenizer.convert_tokens_to_ids(f"<|speech_{size - 1}|>")
-            if last != self.tokenizer.unk_token_id:
+            if last is not None:
                 self._speech_end = self._speech_start + size
                 break
         else:
-            self._speech_end = self._speech_start + 4096
+            self._speech_end = self._speech_start + 65536
+        print(
+            f"Speech token range: [{self._speech_start}, {self._speech_end}) "
+            f"codebook_size={self._speech_end - self._speech_start}"
+        )
 
         print("NeuTTS loaded.")
 
     def _speaker(self, name: str) -> tuple[torch.Tensor, str]:
-        """Load bundled speaker codes + transcript (cached)."""
+        """Load bundled speaker codes + transcript, cached after first access."""
         if name not in self.SPEAKERS:
             raise ValueError(f"Unknown speaker '{name}'. Available: {self.SPEAKERS}")
         if name not in self._speaker_cache:
@@ -128,17 +142,34 @@ class NeuTTSModel(BaseTTS):
     ) -> dict[str, Any]:
         codes, ref_text = self._speaker(voice)
 
+        # Normalise whitespace — mirrors reference normalize_text().
+        text = re.sub(r"\s+", " ", text.strip())
+        ref_text = re.sub(r"\s+", " ", ref_text.strip())
+
         ts = self.tokenizer.convert_tokens_to_ids("<|TEXT_PROMPT_START|>")
         te = self.tokenizer.convert_tokens_to_ids("<|TEXT_PROMPT_END|>")
         sg = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")
+        tr = self.tokenizer.convert_tokens_to_ids("<|TEXT_REPLACE|>")
+        sr = self.tokenizer.convert_tokens_to_ids("<|SPEECH_REPLACE|>")
 
         text_ids = self.tokenizer.encode(
-            f"{ref_text} {text}".strip(), add_special_tokens=False
+            f"{ref_text} {text}", add_special_tokens=False
         )
-        codes_str = "".join(f"<|speech_{i}|>" for i in codes.tolist())
+
+        # Encode the template to capture any BOS / framing the tokeniser adds.
+        base_ids = self.tokenizer.encode("<|TEXT_REPLACE|><|SPEECH_REPLACE|>")
+        tr_idx = base_ids.index(tr)
+        sr_idx = base_ids.index(sr)
+
+        codes_str = "".join(f"<|speech_{int(i)}|>" for i in codes.tolist())
         code_ids = self.tokenizer.encode(codes_str, add_special_tokens=False)
 
-        prompt = [ts] + text_ids + [te, sg] + code_ids
+        prompt = (
+            base_ids[:tr_idx]
+            + [ts] + text_ids + [te]
+            + base_ids[tr_idx + 1 : sr_idx]
+            + [sg] + code_ids
+        )
         ids = torch.tensor(prompt, dtype=torch.long).unsqueeze(0).to(self.device)
         return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
 
@@ -154,18 +185,22 @@ class NeuTTSModel(BaseTTS):
         eos_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
         capture = _SpeechLogitCapture(self._speech_start, self._speech_end)
 
+        input_len = inputs["input_ids"].shape[-1]
+        # Cap total sequence length at 2048 — mirrors reference max_length=2048.
+        max_length = min(input_len + max_new_tokens, 2048)
+
         generated_ids = self.model.generate(
             input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_new_tokens,
+            max_length=max_length,
+            eos_token_id=eos_id,
             do_sample=True,
             temperature=temperature,
             top_k=top_k,
-            eos_token_id=eos_id,
+            use_cache=True,
+            min_new_tokens=50,
             logits_processor=LogitsProcessorList([capture]),
         )
 
-        input_len = inputs["input_ids"].shape[-1]
         audio_tokens, audio_logits = self._extract_audio(
             generated_ids, capture.step_probs, input_len
         )
@@ -187,14 +222,22 @@ class NeuTTSModel(BaseTTS):
         step_probs: list[torch.Tensor],
         input_len: int,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        gen = generated_ids[0, input_len:]
-        speech_mask = (gen >= self._speech_start) & (gen < self._speech_end)
-        indices = speech_mask.nonzero(as_tuple=True)[0].tolist()
+        new_ids = generated_ids[0, input_len:].cpu()
 
-        # Store raw codec codes (0-based), not vocab IDs.
-        audio_tokens = (gen[speech_mask] - self._speech_start).cpu()
+        # Decode to text and extract codec IDs via regex — mirrors reference exactly.
+        generated_text = self.tokenizer.decode(new_ids.tolist(), add_special_tokens=False)
+        speech_ids = [int(x) for x in re.findall(r"<\|speech_(\d+)\|>", generated_text)]
+        audio_tokens = torch.tensor(speech_ids, dtype=torch.long)
+
+        # Align step_probs to speech positions for logit capture.
+        speech_mask = (new_ids >= self._speech_start) & (new_ids < self._speech_end)
+        indices = speech_mask.nonzero(as_tuple=True)[0].tolist()
         probs = [step_probs[i] for i in indices if i < len(step_probs)]
-        audio_logits = torch.stack(probs) if probs else None
+        if probs:
+            stacked = torch.stack(probs).float()
+            audio_logits = torch.softmax(stacked, dim=-1).cpu().half()
+        else:
+            audio_logits = None
         return audio_tokens, audio_logits
 
     def decode_audio(
