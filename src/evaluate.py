@@ -30,6 +30,7 @@ from evaluation.metrics import (
     summarize_scores,
 )
 from models.orpheus_model import OrpheusTTS
+from models.neutts_model import NeuTTSModel
 from quants.config import QUANT_CONFIGS
 from visualization.heatmap import (
     save_codebook_heatmap,
@@ -42,6 +43,7 @@ REPO_ROOT = SRC_DIR.parent
 
 MODEL_REGISTRY = {
     "orpheus": OrpheusTTS,
+    "neutts": NeuTTSModel,
 }
 
 
@@ -91,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--voice",
         default="tara",
-        help="Speaker/voice tag used for prompt formatting.",
+        help="Speaker/voice tag (Orpheus: voice style; NeuTTS: emily/paul/sophie/steven).",
     )
     parser.add_argument(
         "--device",

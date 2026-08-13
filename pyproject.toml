@@ -13,6 +13,7 @@ dependencies = [
     "gptqmodel>=7.0",
     "datasets>=2.0",
     "matplotlib>=3.7",
+    "torchao>=0.9",  # required by neucodec → torchtune; unrelated to GPTQ quantization
 ]
 
 [build-system]

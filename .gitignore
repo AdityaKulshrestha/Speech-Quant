@@ -5,3 +5,5 @@ outputs
 notebooks
 test.py
 quant_models
+logs
+hf_*
