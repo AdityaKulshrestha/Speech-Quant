@@ -22,7 +22,13 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+from transformers import set_seed
 
+from decoding.alignment import CodebookDivergenceAnalyzer, pairwise_wer_matrix
+from evaluation.transcription import (
+    evaluate_transcription_run,
+    load_asr_model,
+)
 from evaluation.metrics import (
     codebook_ids_for_tokens,
     compare_sequences,
@@ -39,8 +45,6 @@ from visualization.heatmap import (
     save_prob_diff_heatmap,
     save_token_heatmap,
 )
-
-from transformers import set_seed
 
 SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SRC_DIR.parent
@@ -178,7 +182,6 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
     synchronize(args.device)
 
     manifest = []
-    from transformers import set_seed
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -260,28 +263,8 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
     return manifest
 
 
-def main() -> None:
-    args = parse_args()
-
-    prompts = load_prompts(args.prompts_file, args.num_samples)
-
-    baseline_model = build_model(args, quant_type="none")
-    # Derive output subdirectory from the model checkpoint name.
-    model_slug = Path(baseline_model.model_name).name  # e.g. "orpheus-3b-0.1-ft"
-    output_dir = Path(args.output_dir) / model_slug
-
-    baseline_model.load()
-    baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
-    baseline_model.unload()
-
-    if args.quant_type == "none":
-        return
-
-    quant_model = build_model(args, quant_type=args.quant_type)
-    quant_model.load()
-    quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
-    quant_model.unload()
-
+def compare_runs(baseline_manifest: list[dict], quant_manifest: list[dict]) -> list[dict]:
+    """Compute token-level sequence comparison metrics for matched prompt runs."""
     per_sample_scores = []
 
     for baseline_entry, quant_entry in zip(baseline_manifest, quant_manifest):
@@ -292,7 +275,6 @@ def main() -> None:
         score["sample_id"] = baseline_entry["sample_id"]
         score["text"] = baseline_entry["text"]
 
-        # Probability difference and KL divergence
         b_path = baseline_entry.get("audio_probs_path")
         q_path = quant_entry.get("audio_probs_path")
         ats = baseline_entry.get("audio_token_start")
@@ -312,19 +294,40 @@ def main() -> None:
 
         per_sample_scores.append(score)
 
+    return per_sample_scores
+
+
+def run_experiment(args: argparse.Namespace) -> None:
+    prompts = load_prompts(args.prompts_file, args.num_samples)
+
+    baseline_model = build_model(args, quant_type="none")
+    model_slug = Path(baseline_model.model_name).name
+    output_dir = Path(args.output_dir) / "evaluation" / model_slug
+    analysis_dir = output_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_model.load()
+    baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
+    baseline_model.unload()
+
+    if args.quant_type == "none":
+        return
+
+    quant_model = build_model(args, quant_type=args.quant_type)
+    quant_model.load()
+    quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
+    quant_model.unload()
+
+    per_sample_scores = compare_runs(baseline_manifest, quant_manifest)
     summary = summarize_scores(per_sample_scores)
 
     print(f"\n=== {args.quant_type} vs baseline ===")
     print(json.dumps(summary, indent=2))
 
-    scores_path = output_dir / f"scores_{args.quant_type}.json"
+    scores_path = analysis_dir / f"scores_{args.quant_type}.json"
     with open(scores_path, "w") as f:
         json.dump({"summary": summary, "per_sample": per_sample_scores}, f, indent=2)
-
     print(f"Scores: {scores_path}")
-
-    analysis_dir = output_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
 
     save_token_heatmap(
         baseline_manifest, quant_manifest,
@@ -338,6 +341,89 @@ def main() -> None:
         per_sample_scores,
         analysis_dir / f"prob_diff_{args.quant_type}.png",
     )
+
+    asr_model_name = "CohereLabs/cohere-transcribe-03-2026"
+    asr_processor, asr_model = load_asr_model(asr_model_name, device_map="auto")
+
+    baseline_result = evaluate_transcription_run(
+        output_dir / "baseline",
+        prompts,
+        asr_model,
+        asr_processor,
+        batch_size=8,
+        sampling_rate=16000,
+        language="en",
+    )
+    quant_result = evaluate_transcription_run(
+        output_dir / args.quant_type,
+        prompts,
+        asr_model,
+        asr_processor,
+        batch_size=8,
+        sampling_rate=16000,
+        language="en",
+    )
+
+    texts_by_label = {
+        "ground_truth": list(prompts),
+        "baseline": baseline_result["transcripts"],
+        args.quant_type: quant_result["transcripts"],
+    }
+    matched_count = min(len(v) for v in texts_by_label.values())
+    texts_by_label = {k: v[:matched_count] for k, v in texts_by_label.items()}
+    pairwise_grid = pairwise_wer_matrix(list(texts_by_label.keys()), texts_by_label)
+
+    divergence_analyzer = CodebookDivergenceAnalyzer(
+        model_name=getattr(baseline_model, "model_name", None),
+        codec_family=(
+            "rvq" if "orpheus" in (getattr(baseline_model, "model_name", "") or "").lower()
+            else "fsq"
+        ),
+    )
+    divergence_summary = divergence_analyzer.analyze_manifest_pair(
+        baseline_manifest[: min(len(baseline_manifest), len(quant_manifest))],
+        quant_manifest[: min(len(baseline_manifest), len(quant_manifest))],
+    )
+
+    codebook_report = {
+        "model": getattr(baseline_model, "model_name", None),
+        "codec_family": divergence_summary["codec_family"],
+        "quant_type": args.quant_type,
+        "analysis": divergence_summary,
+    }
+    codebook_path = analysis_dir / "codebook_divergence.json"
+    with open(codebook_path, "w") as f:
+        json.dump(codebook_report, f, indent=2)
+    print(f"Codebook divergence analysis: {codebook_path}")
+
+    transcription_report = {
+        "model": getattr(baseline_model, "model_name", None),
+        "quant_type": args.quant_type,
+        "batch_size": 8,
+        "ground_truth_vs_baseline": {
+            "mean_wer": baseline_result["mean_wer"],
+            "mean_cer": baseline_result["mean_cer"],
+        },
+        "ground_truth_vs_quant": {
+            "mean_wer": quant_result["mean_wer"],
+            "mean_cer": quant_result["mean_cer"],
+        },
+        "results": [baseline_result, quant_result],
+        "pairwise_wer_grid": pairwise_grid,
+        "codebook_divergence": divergence_summary,
+    }
+    transcription_path = analysis_dir / "transcription.json"
+    with open(transcription_path, "w") as f:
+        json.dump(transcription_report, f, indent=2)
+    print(f"Transcription analysis: {transcription_path}")
+
+    asr_model = None
+    asr_processor = None
+
+
+def main() -> None:
+    args = parse_args()
+    run_experiment(args)
 
 
 if __name__ == "__main__":

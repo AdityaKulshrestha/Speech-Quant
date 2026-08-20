@@ -140,7 +140,7 @@ def transcribe_batch(
         )
 
         audio_chunk_index = inputs.get("audio_chunk_index")
-        inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float16))
+        inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float32))
 
         with torch.inference_mode():
             outputs = model.generate(
@@ -161,6 +161,70 @@ def transcribe_batch(
             results.append(texts)
 
     return results
+
+
+def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
+    """Load the Cohere ASR processor/model pair with the correct dtype for the runtime."""
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = CohereAsrForConditionalGeneration.from_pretrained(
+        model_name,
+        device_map=device_map,
+        torch_dtype=(
+            torch.bfloat16
+            if (torch.xpu.is_available() or torch.cuda.is_available())
+            else torch.float32
+        ),
+    )
+    return processor, model
+
+
+def evaluate_transcription_run(
+    run_dir: Path,
+    prompts: Sequence[str],
+    asr_model: CohereAsrForConditionalGeneration,
+    processor,
+    batch_size: int,
+    sampling_rate: int = DEFAULT_SAMPLE_RATE,
+    language: str = "en",
+) -> dict:
+    """Evaluate one audio run against the prompt list and return aggregate WER/CER metrics."""
+    audio_files = find_audio_files(run_dir)
+    if not audio_files:
+        raise FileNotFoundError(f"No audio files found under {run_dir}")
+
+    n_allowed = min(len(prompts), len(audio_files))
+    selected_files = audio_files[:n_allowed]
+    transcripts = transcribe_batch(
+        asr_model,
+        processor,
+        selected_files,
+        batch_size=batch_size,
+        sampling_rate=sampling_rate,
+        language=language,
+    )
+    if len(transcripts) != n_allowed:
+        raise ValueError(
+            f"Expected {n_allowed} transcripts for {run_dir}, got {len(transcripts)}."
+        )
+
+    entries = []
+    wer_values = []
+    cer_values = []
+    for prompt, transcript in zip(prompts[:n_allowed], transcripts):
+        wer = word_error_rate(prompt, transcript)
+        cer = character_error_rate(prompt, transcript)
+        wer_values.append(wer)
+        cer_values.append(cer)
+        entries.append({"prompt": prompt, "transcript": transcript, "wer": wer, "cer": cer})
+
+    return {
+        "run": run_dir.name,
+        "num_samples": n_allowed,
+        "mean_wer": sum(wer_values) / len(wer_values) if wer_values else 0.0,
+        "mean_cer": sum(cer_values) / len(cer_values) if cer_values else 0.0,
+        "transcripts": transcripts,
+        "samples": entries,
+    }
 
 
 def evaluate_quant_dir(
@@ -278,11 +342,7 @@ def main() -> None:
     prompts = load_prompts(args.prompts_file)
     print(f"Loaded {len(prompts)} ground-truth prompts from {args.prompts_file}")
 
-    processor = AutoProcessor.from_pretrained(args.model)
-    model = CohereAsrForConditionalGeneration.from_pretrained(
-        args.model,
-        device_map="auto",
-    )
+    processor, model = load_asr_model(args.model, device_map="auto")
 
     quant_dirs = collect_quant_dirs(args.audio_root)
     print(f"Evaluating {len(quant_dirs)} quant runs under {args.audio_root}")
