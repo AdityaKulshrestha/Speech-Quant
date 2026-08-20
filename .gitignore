@@ -5,7 +5,13 @@ outputs
 notebooks
 test.py
 quant_models
+voices
 logs
 hf_*
+.config
+.opencode-trace
+outputs*
+quant_models
+logs
 .config
 .opencode-trace

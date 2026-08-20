@@ -15,6 +15,7 @@ to <output-dir>/scores_<quant-type>.json.
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from evaluation.metrics import (
 )
 from models.orpheus_model import OrpheusTTS
 from models.neutts_model import NeuTTSModel
+from models.qwentts_model import QwenTTSModel
 from quants.config import QUANT_CONFIGS
 from visualization.heatmap import (
     save_codebook_heatmap,
@@ -38,12 +40,15 @@ from visualization.heatmap import (
     save_token_heatmap,
 )
 
+from transformers import set_seed
+
 SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SRC_DIR.parent
 
 MODEL_REGISTRY = {
     "orpheus": OrpheusTTS,
     "neutts": NeuTTSModel,
+    "qwen": QwenTTSModel,
 }
 
 
@@ -173,6 +178,16 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
     synchronize(args.device)
 
     manifest = []
+    from transformers import set_seed
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.xpu.manual_seed_all(args.seed)
+
+    torch.use_deterministic_algorithms(True)
+    torch.manual_seed(args.seed)
+    set_seed(args.seed)
 
     for idx, text in enumerate(prompts):
         sample_id = f"sample_{idx:03d}"
@@ -180,7 +195,6 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
 
         # Reset the seed per sample so the baseline and quantized runs
         # draw the same random numbers for a fair token-level comparison.
-        torch.manual_seed(args.seed + idx)
 
         synchronize(args.device)
         start = time.perf_counter()

@@ -21,8 +21,6 @@ from transformers import (
 
 from .base import BaseTTS, GenerationOutput
 
-import neutts as _neutts_pkg
-_SAMPLE_DIR = Path(_neutts_pkg.__file__).parent / "samples"
 
 
 class _SpeechLogitCapture(LogitsProcessor):
@@ -123,13 +121,25 @@ class NeuTTSModel(BaseTTS):
         print("NeuTTS loaded.")
 
     def _speaker(self, name: str) -> tuple[torch.Tensor, str]:
-        """Load bundled speaker codes + transcript, cached after first access."""
         if name not in self.SPEAKERS:
             raise ValueError(f"Unknown speaker '{name}'. Available: {self.SPEAKERS}")
         if name not in self._speaker_cache:
-            codes = torch.load(_SAMPLE_DIR / f"{name}.pt", weights_only=True)
-            text = (_SAMPLE_DIR / f"{name}.txt").read_text().strip()
-            self._speaker_cache[name] = (codes, text)
+            voices = Path(__file__).parents[2] / "voices"
+            pt  = voices / f"{name}.pt"
+            txt = voices / f"{name}.txt"
+            if not pt.exists() or not txt.exists():
+                import shutil, subprocess, tempfile
+                with tempfile.TemporaryDirectory() as tmp:
+                    print("Cloning neutts to fetch speaker voices...")
+                    subprocess.run(
+                        ["git", "clone", "--depth=1",
+                         "https://github.com/neuphonic/neutts.git", tmp],
+                        check=True,
+                    )
+                    shutil.copytree(Path(tmp) / "samples", voices, dirs_exist_ok=True)
+                print(f"Voices saved to {voices}")
+            codes = torch.load(pt, weights_only=True, map_location="cpu")
+            self._speaker_cache[name] = (codes, txt.read_text(encoding="utf-8").strip())
         return self._speaker_cache[name]
 
     # ---------------------------------------------------- BaseTTS interface
