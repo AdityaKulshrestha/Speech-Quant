@@ -1,0 +1,168 @@
+"""
+Phase 1 (Macroscopic) acoustic-distortion metrics from METRICS.md:
+Mel-Cepstral Distortion (MCD) and F0 Frame Error / Pitch Pearson Correlation
+between baseline and quantized waveforms for the same prompt.
+
+These operate on raw audio rather than codec tokens, so they are naturally
+codec-agnostic and apply the same way to Orpheus, NeuTTS, and Qwen TTS.
+
+Phase 1's other metrics (UTMOS/NISQA, SECS) are intentionally not implemented
+here; see METRICS.md.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import librosa
+import numpy as np
+import soundfile as sf
+
+
+def _load_audio(path: str | Path, target_sr: int | None = None) -> tuple[np.ndarray, int]:
+    audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+    if target_sr is not None and sr != target_sr:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        sr = target_sr
+    return audio, sr
+
+
+def mel_cepstral_distortion(
+    reference: np.ndarray,
+    hypothesis: np.ndarray,
+    sr: int,
+    n_mfcc: int = 13,
+) -> float:
+    """Mel-cepstral distortion (dB) between two waveforms of the same prompt.
+
+    MFCCs (excluding the 0th/energy coefficient) stand in for MCEPs, DTW-aligned
+    frame-by-frame, following the standard MCD formula:
+        MCD = (10 / ln(10)) * sqrt(2 * sum((c_ref - c_hyp)^2)), averaged over frames.
+    """
+    ref_mfcc = librosa.feature.mfcc(y=reference, sr=sr, n_mfcc=n_mfcc)[1:]
+    hyp_mfcc = librosa.feature.mfcc(y=hypothesis, sr=sr, n_mfcc=n_mfcc)[1:]
+
+    _, wp = librosa.sequence.dtw(X=ref_mfcc, Y=hyp_mfcc, metric="euclidean")
+    diffs = ref_mfcc[:, wp[:, 0]] - hyp_mfcc[:, wp[:, 1]]
+    frame_dist = np.sqrt((diffs**2).sum(axis=0))
+    return float((10.0 / np.log(10.0)) * np.sqrt(2.0) * frame_dist.mean())
+
+
+def extract_f0(
+    audio: np.ndarray,
+    sr: int,
+    fmin: float = 65.0,
+    fmax: float = 400.0,
+    frame_length: int = 1024,
+) -> np.ndarray:
+    """Frame-wise F0 contour (Hz, 0 for unvoiced frames) via librosa's pYIN."""
+    f0, _voiced_flag, _voiced_prob = librosa.pyin(
+        audio, fmin=fmin, fmax=fmax, sr=sr, frame_length=frame_length
+    )
+    return np.nan_to_num(f0, nan=0.0)
+
+
+def f0_frame_error(
+    reference: np.ndarray,
+    hypothesis: np.ndarray,
+    sr: int,
+    cent_threshold: float = 50.0,
+) -> float:
+    """Fraction of frames with a voicing mismatch or a pitch error above
+    `cent_threshold` cents (on mutually-voiced frames)."""
+    ref_f0 = extract_f0(reference, sr)
+    hyp_f0 = extract_f0(hypothesis, sr)
+    n = min(len(ref_f0), len(hyp_f0))
+    if n == 0:
+        return 0.0
+    ref_f0, hyp_f0 = ref_f0[:n], hyp_f0[:n]
+
+    ref_voiced = ref_f0 > 0
+    hyp_voiced = hyp_f0 > 0
+    voicing_mismatch = ref_voiced != hyp_voiced
+
+    both_voiced = ref_voiced & hyp_voiced
+    cents = np.zeros(n)
+    cents[both_voiced] = 1200.0 * np.abs(np.log2(hyp_f0[both_voiced] / ref_f0[both_voiced]))
+    pitch_error = both_voiced & (cents > cent_threshold)
+
+    return float((voicing_mismatch | pitch_error).mean())
+
+
+def pitch_pearson_correlation(
+    reference: np.ndarray,
+    hypothesis: np.ndarray,
+    sr: int,
+) -> float | None:
+    """Pearson correlation between F0 contours on mutually-voiced frames.
+
+    Returns None when fewer than 2 mutually-voiced frames are available.
+    """
+    ref_f0 = extract_f0(reference, sr)
+    hyp_f0 = extract_f0(hypothesis, sr)
+    n = min(len(ref_f0), len(hyp_f0))
+    if n == 0:
+        return None
+    ref_f0, hyp_f0 = ref_f0[:n], hyp_f0[:n]
+
+    voiced = (ref_f0 > 0) & (hyp_f0 > 0)
+    if voiced.sum() < 2:
+        return None
+
+    corr = np.corrcoef(ref_f0[voiced], hyp_f0[voiced])[0, 1]
+    return float(corr) if np.isfinite(corr) else None
+
+
+def compare_acoustics(reference_path: str | Path, hypothesis_path: str | Path) -> dict[str, Any]:
+    """MCD + F0 Frame Error + Pitch Pearson Correlation for one baseline/quantized audio pair."""
+    reference, sr = _load_audio(reference_path)
+    hypothesis, _ = _load_audio(hypothesis_path, target_sr=sr)
+
+    return {
+        "mcd": mel_cepstral_distortion(reference, hypothesis, sr),
+        "f0_frame_error": f0_frame_error(reference, hypothesis, sr),
+        "pitch_pearson_correlation": pitch_pearson_correlation(reference, hypothesis, sr),
+    }
+
+
+def compare_acoustics_manifest(
+    baseline_manifest: list[dict[str, Any]],
+    quant_manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Run compare_acoustics over every matched baseline/quantized sample pair."""
+    per_sample = []
+    for baseline_entry, quant_entry in zip(baseline_manifest, quant_manifest):
+        result = compare_acoustics(baseline_entry["audio_path"], quant_entry["audio_path"])
+        result["sample_id"] = baseline_entry["sample_id"]
+        result["text"] = baseline_entry["text"]
+        per_sample.append(result)
+    return per_sample
+
+
+def summarize_acoustics(per_sample: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate MCD/F0 metrics across samples for the final score block."""
+    mcds = [s["mcd"] for s in per_sample if s.get("mcd") is not None]
+    fers = [s["f0_frame_error"] for s in per_sample if s.get("f0_frame_error") is not None]
+    corrs = [s["pitch_pearson_correlation"] for s in per_sample if s.get("pitch_pearson_correlation") is not None]
+
+    return {
+        "num_samples": len(per_sample),
+        "mean_mcd": sum(mcds) / len(mcds) if mcds else None,
+        "mean_f0_frame_error": sum(fers) / len(fers) if fers else None,
+        "mean_pitch_pearson_correlation": sum(corrs) / len(corrs) if corrs else None,
+        "num_samples_with_pitch_correlation": len(corrs),
+    }
+
+
+__all__ = [
+    "compare_acoustics",
+    "compare_acoustics_manifest",
+    "extract_f0",
+    "f0_frame_error",
+    "mel_cepstral_distortion",
+    "pitch_pearson_correlation",
+    "summarize_acoustics",
+]

@@ -16,17 +16,26 @@ Workflow
     baseline_out = fp16_model.generate_tokens(inputs)
 
     # 2. Quantized model — teacher-forced on the FP16 reference sequence.
-    quant_probs = extract_teacher_forced_logits(
+    #    token_filter and vocab_slice are model-specific; pass None to collect
+    #    every generated token over the full vocabulary.
+    #
+    #    Orpheus example:
+    #      audio_start = OrpheusTTS.AUDIO_TOKEN_START
+    #      audio_end   = audio_start + OrpheusTTS.TOKENS_PER_FRAME * OrpheusTTS.CODEBOOK_SIZE
+    #      token_filter = lambda t: audio_start <= t < audio_end
+    #      vocab_slice  = (audio_start, audio_end)
+    quant_probs, _token_ids = extract_teacher_forced_logits(
         model=quant_model.model,
         reference_ids=baseline_out.generated_ids,
-        audio_token_start=OrpheusTTS.AUDIO_TOKEN_START,
-        audio_token_end=OrpheusTTS.AUDIO_TOKEN_START
-                        + OrpheusTTS.TOKENS_PER_FRAME * OrpheusTTS.CODEBOOK_SIZE,
         eos_token_id=OrpheusTTS.END_OF_SPEECH,
         prompt_length=baseline_out.metadata["input_length"],
+        token_filter=lambda t: audio_start <= t < audio_end,
+        vocab_slice=(audio_start, audio_end),
+        tokens_per_frame=OrpheusTTS.TOKENS_PER_FRAME,
     )
 
-    # 3. Compare per-frame-position distributions.
+    # 3. Compare distributions; pass tokens_per_frame only for codecs that
+    #    interleave multiple codec levels per frame (e.g. Orpheus/SNAC).
     results = compare_distributions(
         baseline_probs=baseline_out.audio_logits.float(),
         quant_probs=quant_probs,
@@ -36,7 +45,7 @@ Workflow
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -46,56 +55,68 @@ import torch.nn.functional as F
 def extract_teacher_forced_logits(
     model: Any,
     reference_ids: torch.Tensor,
-    audio_token_start: int,
-    audio_token_end: int,
     eos_token_id: int,
     prompt_length: int,
-    tokens_per_frame: int = 7,
-) -> torch.Tensor:
-    """Single forward pass on the full reference sequence; returns audio-subspace
-    softmax probs at each audio token position.
+    token_filter: Callable[[int], bool] | None = None,
+    vocab_slice: tuple[int, int] | None = None,
+    tokens_per_frame: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single forward pass on the full reference sequence; returns softmax probs
+    (and the corresponding reference token ids) at each collected token position.
 
     This is the key decoupling point: the model is called once with the complete
-    FP16 reference sequence, and logits are read at each audio token position
-    without any autoregressive generation loop.
+    reference sequence, and logits are read at each selected position without
+    any autoregressive generation loop.
 
     Args:
         model: HuggingFace causal LM in eval mode (fp16/bf16 or quantized).
-        reference_ids: [1, T] int64 — complete generated_ids from the FP16 run.
-        audio_token_start: first audio vocab index (Orpheus: 128266).
-        audio_token_end: exclusive upper bound of audio vocab range.
-        eos_token_id: token that marks the end of the generated audio.
+        reference_ids: [1, T] int64 — complete generated_ids from the reference run.
+        eos_token_id: token that marks the end of generation.
         prompt_length: number of prompt tokens before the generated portion.
-        tokens_per_frame: truncate result to complete frames (Orpheus: 7).
+        token_filter: ``(token_id) -> bool`` — collect logits only where True.
+            Pass ``None`` to collect every non-EOS generated token.
+            Orpheus: ``lambda t: audio_start <= t < audio_end``.
+        vocab_slice: ``(start, end)`` to restrict the prob vector to a subspace.
+            Pass ``None`` to return the full-vocabulary distribution.
+            Orpheus: ``(audio_token_start, audio_token_end)``.
+        tokens_per_frame: truncate result to complete frames. Default 1 (no-op).
 
     Returns:
-        [num_audio_tokens, audio_vocab_size] float32 on CPU, where
-        num_audio_tokens is a multiple of tokens_per_frame.
+        Tuple of:
+          - ``[N, V']`` float32 probs on CPU, where N is a multiple of tokens_per_frame
+            and V' is ``vocab_slice[1]-vocab_slice[0]`` when a slice is given, or the
+            full vocabulary size otherwise.
+          - ``[N]`` int64 reference token ids (full-vocabulary space), aligned 1:1 with
+            the rows of the probs tensor.
     """
-    audio_size = audio_token_end - audio_token_start
-
     # Single forward pass — no generation, no KV-cache stepping.
     logits = model(reference_ids).logits[0]  # [T, vocab_size]
+    v_start, v_end = (0, logits.shape[-1]) if vocab_slice is None else vocab_slice
+    out_size = v_end - v_start
 
     gen_tokens = reference_ids[0, prompt_length:]
-    audio_probs: list[torch.Tensor] = []
+    collected: list[torch.Tensor] = []
+    collected_token_ids: list[int] = []
 
     for j, tok in enumerate(gen_tokens):
         tok_val = int(tok.item())
         if tok_val == eos_token_id:
             break
-        if audio_token_start <= tok_val < audio_token_end:
+        if token_filter is None or token_filter(tok_val):
             # logits[p-1] predicts the token at absolute position p;
             # gen_token[j] sits at absolute position (prompt_length + j).
-            step_logits = logits[prompt_length + j - 1, audio_token_start:audio_token_end]
-            audio_probs.append(F.softmax(step_logits.float(), dim=-1).cpu())
+            step_logits = logits[prompt_length + j - 1, v_start:v_end]
+            collected.append(F.softmax(step_logits.float(), dim=-1).cpu())
+            collected_token_ids.append(tok_val)
 
-    if not audio_probs:
-        return torch.zeros(0, audio_size, dtype=torch.float32)
+    if not collected:
+        return torch.zeros(0, out_size, dtype=torch.float32), torch.zeros(0, dtype=torch.long)
 
-    # Align to complete frames so positions are comparable to baseline audio_logits.
-    n_complete = (len(audio_probs) // tokens_per_frame) * tokens_per_frame
-    return torch.stack(audio_probs[:n_complete])
+    # Align to complete frames so positions are comparable to baseline probs.
+    n_complete = (len(collected) // tokens_per_frame) * tokens_per_frame
+    probs = torch.stack(collected[:n_complete])
+    token_ids = torch.tensor(collected_token_ids[:n_complete], dtype=torch.long)
+    return probs, token_ids
 
 
 def js_divergence_sequence(
@@ -165,30 +186,33 @@ def _bucket_by_frame_position(
 def compare_distributions(
     baseline_probs: torch.Tensor,
     quant_probs: torch.Tensor,
-    tokens_per_frame: int = 7,
+    tokens_per_frame: int | None = None,
     topk: int = 5,
     eps: float = 1e-8,
 ) -> dict[str, Any]:
     """Full distribution-level comparison between baseline and quantized logits.
 
-    All metrics are bucketed by frame position (step % tokens_per_frame) to
-    isolate coarse vs fine codec levels — position 0 is coarse (L1), positions
-    1-2 are mid (L2), positions 3-6 are fine (L3) for Orpheus/SNAC.
+    When tokens_per_frame is given, metrics are additionally bucketed by frame
+    position (step % tokens_per_frame) to isolate codec levels — useful for
+    residual-VQ codecs like Orpheus/SNAC where each frame has multiple tokens
+    at different granularities. Omit for single-token-per-step models.
 
     Args:
-        baseline_probs: [T, V] float32 — FP16 audio-subspace softmax probs.
+        baseline_probs: [T, V] float32 — reference softmax probs.
             For the FP16 model, pass GenerationOutput.audio_logits directly;
             its free-run logits are equivalent to teacher-forced logits because
             the reference sequence IS the FP16 model's own output.
         quant_probs:    [T, V] float32 — from extract_teacher_forced_logits().
-        tokens_per_frame: 7 for Orpheus/SNAC, 1 for FSQ/NeuTTS.
+        tokens_per_frame: bucket by frame position when set (e.g. 7 for
+            Orpheus/SNAC). Pass None (default) for flat / single-token models.
         topk: neighbourhood size for Jaccard overlap metric.
         eps: numerical floor for KL/JS to avoid log(0).
 
     Returns:
-        dict with three keys:
+        dict with keys:
           ``per_step``         — raw per-step metric lists
-          ``by_frame_position``— per-position mean/count aggregates
+          ``by_frame_position``— per-position aggregates (empty when
+                                 tokens_per_frame is None)
           ``summary``          — overall means across all steps
     """
     n = min(len(baseline_probs), len(quant_probs))
@@ -207,24 +231,24 @@ def compare_distributions(
     argmax_mismatch = (bp.argmax(-1) != qp.argmax(-1)).float()  # [T]
     topk_jac = topk_overlap_sequence(bp, qp, k=topk)        # [T]
 
-    # Bucket each per-step series by frame position.
-    kl_by_pos = _bucket_by_frame_position(kl, tokens_per_frame)
-    js_by_pos = _bucket_by_frame_position(js, tokens_per_frame)
-    mm_by_pos = _bucket_by_frame_position(argmax_mismatch, tokens_per_frame)
-    tk_by_pos = _bucket_by_frame_position(topk_jac, tokens_per_frame)
-
     topk_key = f"mean_top{topk}_jaccard"
+
     by_frame_position: dict[int, dict[str, Any]] = {}
-    for pos in range(tokens_per_frame):
-        kl_v, js_v, mm_v, tk_v = kl_by_pos[pos], js_by_pos[pos], mm_by_pos[pos], tk_by_pos[pos]
-        cnt = len(kl_v)
-        by_frame_position[pos] = {
-            "mean_kl": sum(kl_v) / cnt if cnt else 0.0,
-            "mean_js": sum(js_v) / cnt if cnt else 0.0,
-            "argmax_mismatch_rate": sum(mm_v) / cnt if cnt else 0.0,
-            topk_key: sum(tk_v) / cnt if cnt else 0.0,
-            "num_steps": cnt,
-        }
+    if tokens_per_frame is not None:
+        kl_by_pos = _bucket_by_frame_position(kl, tokens_per_frame)
+        js_by_pos = _bucket_by_frame_position(js, tokens_per_frame)
+        mm_by_pos = _bucket_by_frame_position(argmax_mismatch, tokens_per_frame)
+        tk_by_pos = _bucket_by_frame_position(topk_jac, tokens_per_frame)
+        for pos in range(tokens_per_frame):
+            kl_v, js_v, mm_v, tk_v = kl_by_pos[pos], js_by_pos[pos], mm_by_pos[pos], tk_by_pos[pos]
+            cnt = len(kl_v)
+            by_frame_position[pos] = {
+                "mean_kl": sum(kl_v) / cnt if cnt else 0.0,
+                "mean_js": sum(js_v) / cnt if cnt else 0.0,
+                "argmax_mismatch_rate": sum(mm_v) / cnt if cnt else 0.0,
+                topk_key: sum(tk_v) / cnt if cnt else 0.0,
+                "num_steps": cnt,
+            }
 
     summary: dict[str, Any] = {
         "num_steps": n,

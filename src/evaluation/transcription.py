@@ -29,10 +29,28 @@ from transformers.audio_utils import load_audio
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
 DEFAULT_SAMPLE_RATE = 16000
 
+_normalizer = None  # lazy singleton: NeMo grammar construction takes ~30s
+
+
+def _get_normalizer():
+    global _normalizer
+    if _normalizer is None:
+        from nemo_text_processing.text_normalization.normalize import Normalizer
+
+        _normalizer = Normalizer(input_case="cased", lang="en")
+    return _normalizer
+
 
 def normalize_text(text: str) -> str:
-    """Normalize text for robust WER/CER comparison."""
-    return " ".join((text or "").lower().strip().split())
+    """Expand text to spoken form (numbers, dates, currency, etc.) via NeMo, then
+    lowercase + collapse whitespace for robust WER/CER comparison."""
+    text = text or ""
+    try:
+        text = _get_normalizer().normalize(text, verbose=False)
+    except Exception as e:
+        print(f"[normalize_text] NeMo normalization failed for {text!r} ({e}); using raw text.")
+    return " ".join(text.lower().strip().split())
+
 
 
 def levenshtein_distance(ref: Sequence[str], hyp: Sequence[str]) -> int:

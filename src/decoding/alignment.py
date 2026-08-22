@@ -26,26 +26,35 @@ class CodecSpec:
 def detect_codec_family(model_name: str | None) -> str:
     """Infer whether the model uses RVQ or FSQ-style tokenization."""
     name = (model_name or "").lower()
-    if any(token in name for token in ("orpheus", "snac", "rvq")):
+    if any(token in name for token in ("orpheus", "snac", "qwen", "rvq")):
         return "rvq"
     if any(token in name for token in ("neutts", "fsq", "neucodec")):
         return "fsq"
     return "rvq"
 
 
-def get_codec_spec(model_name: str | None = None, family: str | None = None) -> CodecSpec:
-    """Return the hierarchy metadata used to bucket mismatch severity by token level."""
+def get_codec_spec(
+    model_name: str | None = None,
+    family: str | None = None,
+    tokens_per_frame: int | None = None,
+) -> CodecSpec:
+    """Return the hierarchy metadata used to bucket mismatch severity by token level.
+
+    tokens_per_frame overrides the family default (Orpheus/SNAC: 7). Qwen TTS uses
+    a variable number of code groups per frame, so any frame size other than the
+    Orpheus 7-token layout falls back to a generic coarse (position 0) vs. fine
+    (remaining positions) split instead of the fixed coarse/medium/fine table.
+    """
     codec_family = (family or detect_codec_family(model_name) or "rvq").lower()
     if codec_family == "rvq":
-        return CodecSpec(
-            family="rvq",
-            tokens_per_frame=7,
-            hierarchy={
-                "coarse": [0],
-                "medium": [1, 2],
-                "fine": [3, 4, 5, 6],
-            },
-        )
+        tpf = tokens_per_frame or 7
+        if tpf == 7:
+            hierarchy = {"coarse": [0], "medium": [1, 2], "fine": [3, 4, 5, 6]}
+        elif tpf > 1:
+            hierarchy = {"coarse": [0], "fine": list(range(1, tpf))}
+        else:
+            hierarchy = {"coarse": [0]}
+        return CodecSpec(family="rvq", tokens_per_frame=tpf, hierarchy=hierarchy)
     return CodecSpec(
         family="fsq",
         tokens_per_frame=1,
@@ -167,13 +176,7 @@ def analyze_codebook_divergence(
     with the common coarse/medium/fine layout. For FSQ-style codecs, this is a
     flat token stream without a hierarchical sub-codebook split.
     """
-    spec = get_codec_spec(model_name=model_name, family=codec_family)
-    if tokens_per_frame is not None:
-        spec = CodecSpec(
-            family=spec.family,
-            tokens_per_frame=tokens_per_frame,
-            hierarchy=spec.hierarchy,
-        )
+    spec = get_codec_spec(model_name=model_name, family=codec_family, tokens_per_frame=tokens_per_frame)
 
     baseline_list = _as_int_list(baseline_tokens)
     quant_list = _as_int_list(quant_tokens)
@@ -236,9 +239,15 @@ def analyze_codebook_divergence(
 class CodebookDivergenceAnalyzer:
     """Aggregates codebook divergence statistics across a manifest pair."""
 
-    def __init__(self, model_name: str | None = None, codec_family: str | None = None):
+    def __init__(
+        self,
+        model_name: str | None = None,
+        codec_family: str | None = None,
+        tokens_per_frame: int | None = None,
+    ):
         self.model_name = model_name
         self.codec_family = codec_family or detect_codec_family(model_name)
+        self.tokens_per_frame = tokens_per_frame
 
     def analyze_pair(self, baseline_entry: dict[str, Any], quant_entry: dict[str, Any]) -> dict[str, Any]:
         baseline_tokens = baseline_entry.get("audio_tokens") or []
@@ -248,6 +257,7 @@ class CodebookDivergenceAnalyzer:
             quant_tokens,
             model_name=self.model_name,
             codec_family=self.codec_family,
+            tokens_per_frame=self.tokens_per_frame,
         )
 
     def analyze_manifest_pair(self, baseline_manifest: Sequence[dict[str, Any]], quant_manifest: Sequence[dict[str, Any]]) -> dict[str, Any]:

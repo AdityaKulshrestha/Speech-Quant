@@ -9,8 +9,8 @@ If --quant-type is "none" (default), only the full-precision baseline
 runs. If a quant flavour is given (see quants/config.py), the baseline
 and the quantized model are both run on the same prompts, and the
 generated codec-token sequences are compared using the FDP / D(t)
-metrics from METRICS.md. The comparison scores are printed and dumped
-to <output-dir>/scores_<quant-type>.json.
+metrics from METRICS.md. Results are upserted into a single consolidated
+workbook at <output-dir>/evaluation/analysis_report.xlsx.
 """
 
 import argparse
@@ -24,8 +24,10 @@ import soundfile as sf
 import torch
 from transformers import set_seed
 
-from decoding.alignment import CodebookDivergenceAnalyzer, pairwise_wer_matrix
+from decoding.alignment import CodebookDivergenceAnalyzer, detect_codec_family
 from decoding.distribution import compare_distributions, extract_teacher_forced_logits
+from evaluation.acoustic_metrics import compare_acoustics_manifest, summarize_acoustics
+from evaluation.report import update_report
 from evaluation.transcription import (
     evaluate_transcription_run,
     load_asr_model,
@@ -220,7 +222,8 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
 
         # Codebook IDs and per-token probabilities
         num_tok = output.audio_tokens.numel()
-        cb_ids = codebook_ids_for_tokens(num_tok)
+        tokens_per_frame = getattr(model, "TOKENS_PER_FRAME", 7)
+        cb_ids = codebook_ids_for_tokens(num_tok, tokens_per_frame=tokens_per_frame)
 
         audio_probs_path = None
         token_probs: list[float] = []
@@ -307,14 +310,19 @@ def teacher_forced_distribution_compare(
     quant_model,
 ) -> list[dict]:
     """Re-run the quantized model on FP16 reference sequences for clean per-position
-    distribution metrics without sequence-drift contamination."""
+    distribution metrics without sequence-drift contamination.
+
+    Each per-sample result also carries step-level detail (aligned with
+    result["per_step"]): the reference token id at each step plus the
+    baseline's and quant's own probability of that exact token, so callers
+    can build a full row-level table instead of only frame-bucketed summaries.
+    """
     _required = ("model", "AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
     if not all(hasattr(quant_model, a) for a in _required):
         return []
 
-    audio_token_end = (
-        quant_model.AUDIO_TOKEN_START + quant_model.TOKENS_PER_FRAME * quant_model.CODEBOOK_SIZE
-    )
+    audio_start = quant_model.AUDIO_TOKEN_START
+    audio_end = audio_start + quant_model.TOKENS_PER_FRAME * quant_model.CODEBOOK_SIZE
     per_sample = []
 
     for entry in baseline_manifest:
@@ -328,13 +336,13 @@ def teacher_forced_distribution_compare(
         reference_ids = torch.load(gids_path, map_location=quant_model.device, weights_only=True)
         baseline_probs = torch.from_numpy(np.load(probs_path)).float()
 
-        quant_probs = extract_teacher_forced_logits(
+        quant_probs, token_ids = extract_teacher_forced_logits(
             model=quant_model.model,
             reference_ids=reference_ids,
-            audio_token_start=quant_model.AUDIO_TOKEN_START,
-            audio_token_end=audio_token_end,
             eos_token_id=quant_model.END_OF_SPEECH,
             prompt_length=entry["input_length"],
+            token_filter=lambda t: audio_start <= t < audio_end,
+            vocab_slice=(audio_start, audio_end),
             tokens_per_frame=quant_model.TOKENS_PER_FRAME,
         )
 
@@ -343,6 +351,15 @@ def teacher_forced_distribution_compare(
             quant_probs=quant_probs,
             tokens_per_frame=quant_model.TOKENS_PER_FRAME,
         )
+
+        # step_* arrays line up 1:1 with result["per_step"]'s kl/js/argmax_mismatch lists.
+        n = min(len(baseline_probs), len(quant_probs), len(token_ids))
+        offsets = (token_ids[:n] - audio_start).long()
+        idx = torch.arange(n)
+        result["step_token_ids"] = token_ids[:n].tolist()
+        result["step_baseline_prob"] = baseline_probs[:n][idx, offsets].tolist()
+        result["step_quant_prob"] = quant_probs[:n][idx, offsets].tolist()
+
         result["sample_id"] = entry["sample_id"]
         result["text"] = entry["text"]
         per_sample.append(result)
@@ -401,25 +418,16 @@ def run_experiment(args: argparse.Namespace) -> None:
     summary = summarize_scores(per_sample_scores)
     dist_summary = _aggregate_distribution_summary(dist_per_sample)
 
+    acoustics_per_sample = compare_acoustics_manifest(baseline_manifest, quant_manifest)
+    acoustics_summary = summarize_acoustics(acoustics_per_sample)
+
     print(f"\n=== {args.quant_type} vs baseline ===")
     print(json.dumps(summary, indent=2))
     if dist_summary:
         print("Distribution analysis (teacher-forced):")
         print(json.dumps(dist_summary, indent=2))
-
-    scores_path = analysis_dir / f"scores_{args.quant_type}.json"
-    with open(scores_path, "w") as f:
-        json.dump(
-            {
-                "summary": summary,
-                "distribution_summary": dist_summary,
-                "per_sample": per_sample_scores,
-                "distribution_per_sample": dist_per_sample,
-            },
-            f,
-            indent=2,
-        )
-    print(f"Scores: {scores_path}")
+    print("Acoustic distortion (MCD / F0):")
+    print(json.dumps(acoustics_summary, indent=2))
 
     save_token_heatmap(
         baseline_manifest, quant_manifest,
@@ -456,58 +464,33 @@ def run_experiment(args: argparse.Namespace) -> None:
         language="en",
     )
 
-    texts_by_label = {
-        "ground_truth": list(prompts),
-        "baseline": baseline_result["transcripts"],
-        args.quant_type: quant_result["transcripts"],
-    }
-    matched_count = min(len(v) for v in texts_by_label.values())
-    texts_by_label = {k: v[:matched_count] for k, v in texts_by_label.items()}
-    pairwise_grid = pairwise_wer_matrix(list(texts_by_label.keys()), texts_by_label)
-
     divergence_analyzer = CodebookDivergenceAnalyzer(
         model_name=getattr(baseline_model, "model_name", None),
-        codec_family=(
-            "rvq" if "orpheus" in (getattr(baseline_model, "model_name", "") or "").lower()
-            else "fsq"
-        ),
+        codec_family=detect_codec_family(getattr(baseline_model, "model_name", None)),
+        tokens_per_frame=getattr(baseline_model, "TOKENS_PER_FRAME", None),
     )
     divergence_summary = divergence_analyzer.analyze_manifest_pair(
         baseline_manifest[: min(len(baseline_manifest), len(quant_manifest))],
         quant_manifest[: min(len(baseline_manifest), len(quant_manifest))],
     )
 
-    codebook_report = {
-        "model": getattr(baseline_model, "model_name", None),
-        "codec_family": divergence_summary["codec_family"],
-        "quant_type": args.quant_type,
-        "analysis": divergence_summary,
-    }
-    codebook_path = analysis_dir / "codebook_divergence.json"
-    with open(codebook_path, "w") as f:
-        json.dump(codebook_report, f, indent=2)
-    print(f"Codebook divergence analysis: {codebook_path}")
-
-    transcription_report = {
-        "model": getattr(baseline_model, "model_name", None),
-        "quant_type": args.quant_type,
-        "batch_size": 8,
-        "ground_truth_vs_baseline": {
-            "mean_wer": baseline_result["mean_wer"],
-            "mean_cer": baseline_result["mean_cer"],
-        },
-        "ground_truth_vs_quant": {
-            "mean_wer": quant_result["mean_wer"],
-            "mean_cer": quant_result["mean_cer"],
-        },
-        "results": [baseline_result, quant_result],
-        "pairwise_wer_grid": pairwise_grid,
-        "codebook_divergence": divergence_summary,
-    }
-    transcription_path = analysis_dir / "transcription.json"
-    with open(transcription_path, "w") as f:
-        json.dump(transcription_report, f, indent=2)
-    print(f"Transcription analysis: {transcription_path}")
+    report_path = Path(args.output_dir) / "evaluation" / "analysis_report.xlsx"
+    update_report(
+        report_path,
+        model=getattr(baseline_model, "model_name", None),
+        quant_type=args.quant_type,
+        scores_summary=summary,
+        per_sample_scores=per_sample_scores,
+        dist_summary=dist_summary,
+        dist_per_sample=dist_per_sample,
+        acoustics_summary=acoustics_summary,
+        acoustics_per_sample=acoustics_per_sample,
+        codebook_divergence=divergence_summary,
+        baseline_transcription=baseline_result,
+        quant_transcription=quant_result,
+        audio_token_start=getattr(baseline_model, "AUDIO_TOKEN_START", None),
+    )
+    print(f"Consolidated report updated: {report_path}")
 
     asr_model = None
     asr_processor = None

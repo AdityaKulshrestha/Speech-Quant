@@ -13,12 +13,24 @@ Extended metrics:
 import torch
 
 # Orpheus 7-token frame layout: [L1, L2, L3, L3, L2, L3, L3]
-_FRAME_CODEBOOK = [0, 1, 2, 2, 1, 2, 2]
+_ORPHEUS_FRAME_CODEBOOK = [0, 1, 2, 2, 1, 2, 2]
 
 
-def codebook_ids_for_tokens(num_tokens: int) -> list[int]:
-    """Codebook index (0=L1/coarsest, 1=L2, 2=L3/finest) for each flat token position."""
-    return [_FRAME_CODEBOOK[t % 7] for t in range(num_tokens)]
+def codebook_ids_for_tokens(
+    num_tokens: int,
+    tokens_per_frame: int = 7,
+    frame_layout: list[int] | None = None,
+) -> list[int]:
+    """Codebook index for each flat token position, generic across codec families.
+
+    Orpheus/SNAC (tokens_per_frame=7) keeps its coarse/medium/fine layout by
+    default. Any other frame size (e.g. Qwen TTS's variable code-group count,
+    or 1 for flat FSQ codecs) falls back to the identity layout: slot t%tpf
+    maps to codebook id t%tpf.
+    """
+    if frame_layout is None:
+        frame_layout = _ORPHEUS_FRAME_CODEBOOK if tokens_per_frame == 7 else list(range(tokens_per_frame))
+    return [frame_layout[t % tokens_per_frame] for t in range(num_tokens)]
 
 
 def probability_difference(

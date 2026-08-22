@@ -4,16 +4,28 @@ Qwen3 TTS model adapter for the Speech-Quant BaseTTS interface.
 Wraps Qwen3TTSModel (custom_voice type) using its internal generate step
 to capture codec codes as audio_tokens before decoding.
 
-Requires the qwen_tts package:
-    pip install git+https://github.com/QwenLM/Qwen3-TTS
+qwen_tts==0.1.1 pins transformers==4.57.3 exactly and breaks under this repo's
+main transformers version (multiple incompatible API changes: check_model_inputs,
+PreTrainedConfig special-token defaults, RoPE init registry). Run this model with
+the dedicated `.venv-qwen` environment instead of the main `.venv`:
+    uv venv .venv-qwen --python 3.12.13
+    echo "<repo>/.venv/lib/python3.12/site-packages" > \\
+        .venv-qwen/lib/python3.12/site-packages/_main_venv_link.pth
+    uv pip install --python .venv-qwen/bin/python3.12 \\
+        "transformers==4.57.3" "qwen_tts @ git+https://github.com/QwenLM/Qwen3-TTS"
+    # then remove the CUDA torch/torchaudio/nvidia-* + gradio/demo-CLI extras
+    # qwen_tts pulls in as required deps, so the linked xpu torch build is used.
 """
 
 import re
 from typing import Any, Optional
 
 import torch
+import transformers
 
 from .base import BaseTTS, GenerationOutput
+
+_REQUIRED_TRANSFORMERS_PREFIX = "4.57."
 
 
 class QwenTTSModel(BaseTTS):
@@ -45,6 +57,12 @@ class QwenTTSModel(BaseTTS):
     # ------------------------------------------------------------------ load
 
     def load(self) -> None:
+        if not transformers.__version__.startswith(_REQUIRED_TRANSFORMERS_PREFIX):
+            raise RuntimeError(
+                f"QwenTTSModel requires transformers=={_REQUIRED_TRANSFORMERS_PREFIX}x "
+                f"(found {transformers.__version__}). Run this model from the dedicated "
+                ".venv-qwen environment, not the main .venv — see this module's docstring."
+            )
         try:
             from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
         except ImportError:
@@ -76,6 +94,13 @@ class QwenTTSModel(BaseTTS):
 
         self.SAMPLE_RATE = self._qwen.model.speech_tokenizer.get_model_type(
         ) and self._qwen.model.speech_tokenizer.model.get_output_sample_rate() or 24_000
+
+        # Frame size for token-level metrics (FDP/D(t)/codebook-divergence);
+        # KL/distribution comparison isn't supported here since the talker has
+        # no plain forward(input_ids)->logits API to teacher-force against.
+        talker_config = self._qwen.model.config.talker_config
+        self.TOKENS_PER_FRAME = talker_config.num_code_groups
+        self.CODEBOOK_SIZE = talker_config.vocab_size
 
         print("Qwen3 TTS loaded.")
         print("Supported speakers:", self._qwen.get_supported_speakers())

@@ -48,6 +48,7 @@ class NeuTTSModel(BaseTTS):
     AUDIO_TOKEN_START = 0
     SAMPLE_RATE = 24_000
     SPEAKERS = ("emily", "paul", "sophie", "steven")
+    TOKENS_PER_FRAME = 1  # flat FSQ codec: no RVQ frame structure
 
     def __init__(
         self,
