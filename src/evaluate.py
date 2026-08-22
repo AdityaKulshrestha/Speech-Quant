@@ -25,6 +25,7 @@ import torch
 from transformers import set_seed
 
 from decoding.alignment import CodebookDivergenceAnalyzer, pairwise_wer_matrix
+from decoding.distribution import compare_distributions, extract_teacher_forced_logits
 from evaluation.transcription import (
     evaluate_transcription_run,
     load_asr_model,
@@ -235,6 +236,9 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
             audio_probs_path = run_dir / f"{sample_id}_audio_probs.npy"
             np.save(str(audio_probs_path), output.audio_logits.numpy())
 
+        generated_ids_path = run_dir / f"{sample_id}_generated_ids.pt"
+        torch.save(output.generated_ids.cpu(), str(generated_ids_path))
+
         manifest.append(
             {
                 "sample_id": sample_id,
@@ -250,6 +254,7 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
                 "token_probs": token_probs,
                 "audio_token_start": audio_token_start,
                 "audio_probs_path": str(audio_probs_path) if audio_probs_path else None,
+                "generated_ids_path": str(generated_ids_path),
                 **output.metadata,
             }
         )
@@ -297,6 +302,79 @@ def compare_runs(baseline_manifest: list[dict], quant_manifest: list[dict]) -> l
     return per_sample_scores
 
 
+def teacher_forced_distribution_compare(
+    baseline_manifest: list[dict],
+    quant_model,
+) -> list[dict]:
+    """Re-run the quantized model on FP16 reference sequences for clean per-position
+    distribution metrics without sequence-drift contamination."""
+    _required = ("model", "AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
+    if not all(hasattr(quant_model, a) for a in _required):
+        return []
+
+    audio_token_end = (
+        quant_model.AUDIO_TOKEN_START + quant_model.TOKENS_PER_FRAME * quant_model.CODEBOOK_SIZE
+    )
+    per_sample = []
+
+    for entry in baseline_manifest:
+        gids_path = entry.get("generated_ids_path")
+        probs_path = entry.get("audio_probs_path")
+        if not gids_path or not probs_path:
+            continue
+        if not Path(gids_path).exists() or not Path(probs_path).exists():
+            continue
+
+        reference_ids = torch.load(gids_path, map_location=quant_model.device, weights_only=True)
+        baseline_probs = torch.from_numpy(np.load(probs_path)).float()
+
+        quant_probs = extract_teacher_forced_logits(
+            model=quant_model.model,
+            reference_ids=reference_ids,
+            audio_token_start=quant_model.AUDIO_TOKEN_START,
+            audio_token_end=audio_token_end,
+            eos_token_id=quant_model.END_OF_SPEECH,
+            prompt_length=entry["input_length"],
+            tokens_per_frame=quant_model.TOKENS_PER_FRAME,
+        )
+
+        result = compare_distributions(
+            baseline_probs=baseline_probs,
+            quant_probs=quant_probs,
+            tokens_per_frame=quant_model.TOKENS_PER_FRAME,
+        )
+        result["sample_id"] = entry["sample_id"]
+        result["text"] = entry["text"]
+        per_sample.append(result)
+
+    return per_sample
+
+
+def _aggregate_distribution_summary(per_sample: list[dict]) -> dict:
+    """Average per-sample distribution summaries and aggregate by_frame_position."""
+    summaries = [s["summary"] for s in per_sample if s.get("summary")]
+    if not summaries:
+        return {}
+
+    scalar_keys = [k for k in summaries[0] if k not in ("num_steps", "tokens_per_frame")]
+    agg: dict = {
+        "num_samples": len(summaries),
+        "tokens_per_frame": summaries[0].get("tokens_per_frame"),
+        **{k: sum(s[k] for s in summaries) / len(summaries) for k in scalar_keys},
+    }
+
+    all_pos = [s.get("by_frame_position", {}) for s in per_sample if s.get("by_frame_position")]
+    if all_pos:
+        positions = sorted(all_pos[0].keys())
+        metric_keys = [k for k in all_pos[0][positions[0]] if k != "num_steps"]
+        agg["by_frame_position"] = {
+            pos: {k: sum(pd[pos][k] for pd in all_pos if pos in pd) / len(all_pos) for k in metric_keys}
+            for pos in positions
+        }
+
+    return agg
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     prompts = load_prompts(args.prompts_file, args.num_samples)
 
@@ -316,17 +394,31 @@ def run_experiment(args: argparse.Namespace) -> None:
     quant_model = build_model(args, quant_type=args.quant_type)
     quant_model.load()
     quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
+    dist_per_sample = teacher_forced_distribution_compare(baseline_manifest, quant_model)
     quant_model.unload()
 
     per_sample_scores = compare_runs(baseline_manifest, quant_manifest)
     summary = summarize_scores(per_sample_scores)
+    dist_summary = _aggregate_distribution_summary(dist_per_sample)
 
     print(f"\n=== {args.quant_type} vs baseline ===")
     print(json.dumps(summary, indent=2))
+    if dist_summary:
+        print("Distribution analysis (teacher-forced):")
+        print(json.dumps(dist_summary, indent=2))
 
     scores_path = analysis_dir / f"scores_{args.quant_type}.json"
     with open(scores_path, "w") as f:
-        json.dump({"summary": summary, "per_sample": per_sample_scores}, f, indent=2)
+        json.dump(
+            {
+                "summary": summary,
+                "distribution_summary": dist_summary,
+                "per_sample": per_sample_scores,
+                "distribution_per_sample": dist_per_sample,
+            },
+            f,
+            indent=2,
+        )
     print(f"Scores: {scores_path}")
 
     save_token_heatmap(
