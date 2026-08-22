@@ -119,6 +119,14 @@ class NeuTTSModel(BaseTTS):
             f"codebook_size={self._speech_end - self._speech_start}"
         )
 
+        # Constants for teacher-forced distribution comparison (single flat
+        # codebook, unlike Orpheus's 7-token RVQ frame). VOCAB_AUDIO_TOKEN_START
+        # is the real tokenizer-vocab offset (unlike AUDIO_TOKEN_START=0, which
+        # is relative to the already-de-offset regex-extracted audio_tokens).
+        self.VOCAB_AUDIO_TOKEN_START = self._speech_start
+        self.CODEBOOK_SIZE = self._speech_end - self._speech_start
+        self.END_OF_SPEECH = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
+
         print("NeuTTS loaded.")
 
     def _speaker(self, name: str) -> tuple[torch.Tensor, str]:

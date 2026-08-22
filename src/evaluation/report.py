@@ -10,11 +10,12 @@ Sheets:
   Summary      - one metric per row, one column per (model, quant_type)
   PerSample    - one row per (model, quant_type, sample_id): aggregated per-sample stats,
                  plus ground truth / baseline / quant transcript text
-  LogProbs_KL  - one row per (model, quant_type, sample_id, step): the teacher-forced
-                 token id (LLM-vocab and codec-space), each model's probability of that
-                 token, and the per-step KL/JS/argmax-match/top-k-jaccard. Row-level, not
-                 bucketed by codec/frame position (codebook_id is kept as an informational
-                 column). Only populated for models where teacher forcing is supported.
+  LogProbs_KL  - one row per (model, quant_type, sample_id, step): baseline and quant
+                 token ids (both LLM-vocab and codec-space) and probabilities kept
+                 adjacent for direct comparison, plus per-step KL/JS/argmax-match/
+                 top-k-jaccard. Row-level, not bucketed by codec/frame position
+                 (codebook_id is kept as an informational column). Only populated for
+                 models where teacher forcing is supported.
   Codec        - one row per (model, quant_type, sample_id, hierarchy_level): codebook
                  divergence rates from the RVQ/FSQ hierarchy breakdown
 
@@ -152,7 +153,13 @@ def _logprobs_kl_rows(
     dist_per_sample: list[dict[str, Any]],
     audio_token_start: int | None,
 ) -> pd.DataFrame:
-    """One row per teacher-forced generation step (not bucketed by codec level)."""
+    """One row per teacher-forced generation step (not bucketed by codec level).
+
+    baseline/quant token ids and probs are kept adjacent so they're directly
+    comparable: baseline_* is the actual reference token and the baseline
+    model's own probability of it; quant_* is the quantized model's argmax
+    prediction at that same step and its probability of the reference token.
+    """
     rows = []
     for entry in dist_per_sample:
         sample_id = entry.get("sample_id")
@@ -161,7 +168,8 @@ def _logprobs_kl_rows(
         summary = entry.get("summary") or {}
         tokens_per_frame = summary.get("tokens_per_frame") or 1
 
-        token_ids = entry.get("step_token_ids") or []
+        baseline_token_ids = entry.get("step_baseline_token_id") or []
+        quant_token_ids = entry.get("step_quant_token_id") or []
         baseline_prob = entry.get("step_baseline_prob") or []
         quant_prob = entry.get("step_quant_prob") or []
         kl = per_step.get("kl") or []
@@ -170,11 +178,15 @@ def _logprobs_kl_rows(
         topk_key = next((k for k in per_step if k.startswith("top") and k.endswith("_jaccard")), None)
         topk_jaccard = per_step.get(topk_key) or [] if topk_key else []
 
-        n = min(len(token_ids), len(baseline_prob), len(quant_prob), len(kl), len(js), len(argmax_mismatch))
+        n = min(
+            len(baseline_token_ids), len(quant_token_ids), len(baseline_prob), len(quant_prob),
+            len(kl), len(js), len(argmax_mismatch),
+        )
         codebook_ids = codebook_ids_for_tokens(n, tokens_per_frame=tokens_per_frame)
 
         for step in range(n):
-            llm_token_id = token_ids[step]
+            baseline_llm_id = baseline_token_ids[step]
+            quant_llm_id = quant_token_ids[step]
             rows.append(
                 {
                     "model": model,
@@ -182,11 +194,15 @@ def _logprobs_kl_rows(
                     "sample_id": sample_id,
                     "ground_truth_text": text,
                     "step": step,
-                    "llm_token_id": llm_token_id,
-                    "audio_codec_token_id": (
-                        llm_token_id - audio_token_start if audio_token_start is not None else None
-                    ),
                     "codebook_id": codebook_ids[step],
+                    "llm_token_id_baseline": baseline_llm_id,
+                    "llm_token_id_quant": quant_llm_id,
+                    "audio_codec_token_id_baseline": (
+                        baseline_llm_id - audio_token_start if audio_token_start is not None else None
+                    ),
+                    "audio_codec_token_id_quant": (
+                        quant_llm_id - audio_token_start if audio_token_start is not None else None
+                    ),
                     "baseline_prob": baseline_prob[step],
                     "quant_prob": quant_prob[step],
                     "kl": kl[step],

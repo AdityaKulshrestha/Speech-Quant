@@ -313,15 +313,21 @@ def teacher_forced_distribution_compare(
     distribution metrics without sequence-drift contamination.
 
     Each per-sample result also carries step-level detail (aligned with
-    result["per_step"]): the reference token id at each step plus the
-    baseline's and quant's own probability of that exact token, so callers
-    can build a full row-level table instead of only frame-bucketed summaries.
+    result["per_step"]): the baseline's actual (reference) token at each step,
+    the quant model's own predicted (argmax) token at that same step, and each
+    model's probability of the reference token — so callers can build a full
+    row-level table instead of only frame-bucketed summaries.
     """
     _required = ("model", "AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
     if not all(hasattr(quant_model, a) for a in _required):
         return []
 
-    audio_start = quant_model.AUDIO_TOKEN_START
+    # VOCAB_AUDIO_TOKEN_START is the real tokenizer-vocab offset of the audio/codec
+    # token block; AUDIO_TOKEN_START may instead be relative to an already
+    # de-offset token representation (e.g. NeuTTS's regex-extracted audio_tokens).
+    audio_start = getattr(quant_model, "VOCAB_AUDIO_TOKEN_START", None)
+    if audio_start is None:
+        audio_start = quant_model.AUDIO_TOKEN_START
     audio_end = audio_start + quant_model.TOKENS_PER_FRAME * quant_model.CODEBOOK_SIZE
     per_sample = []
 
@@ -356,7 +362,9 @@ def teacher_forced_distribution_compare(
         n = min(len(baseline_probs), len(quant_probs), len(token_ids))
         offsets = (token_ids[:n] - audio_start).long()
         idx = torch.arange(n)
-        result["step_token_ids"] = token_ids[:n].tolist()
+        quant_argmax = quant_probs[:n].argmax(dim=-1)
+        result["step_baseline_token_id"] = token_ids[:n].tolist()
+        result["step_quant_token_id"] = (quant_argmax + audio_start).tolist()
         result["step_baseline_prob"] = baseline_probs[:n][idx, offsets].tolist()
         result["step_quant_prob"] = quant_probs[:n][idx, offsets].tolist()
 
@@ -488,7 +496,11 @@ def run_experiment(args: argparse.Namespace) -> None:
         codebook_divergence=divergence_summary,
         baseline_transcription=baseline_result,
         quant_transcription=quant_result,
-        audio_token_start=getattr(baseline_model, "AUDIO_TOKEN_START", None),
+        audio_token_start=(
+            getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None)
+            if getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None) is not None
+            else getattr(baseline_model, "AUDIO_TOKEN_START", None)
+        ),
     )
     print(f"Consolidated report updated: {report_path}")
 
