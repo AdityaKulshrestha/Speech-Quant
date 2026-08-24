@@ -26,9 +26,9 @@ class CodecSpec:
 def detect_codec_family(model_name: str | None) -> str:
     """Infer whether the model uses RVQ or FSQ-style tokenization."""
     name = (model_name or "").lower()
-    if any(token in name for token in ("orpheus", "snac", "qwen", "rvq")):
+    if any(token in name for token in ("orpheus", "snac", "qwen", "outetts", "dac", "rvq")):
         return "rvq"
-    if any(token in name for token in ("neutts", "fsq", "neucodec")):
+    if any(token in name for token in ("neutts", "fsq", "neucodec", "llasa", "xcodec2")):
         return "fsq"
     return "rvq"
 
@@ -302,10 +302,61 @@ class CodebookDivergenceAnalyzer:
         }
 
 
+def teacher_forced_hierarchy_divergence(
+    dist_per_sample: Sequence[dict[str, Any]],
+    model_name: str | None = None,
+    codec_family: str | None = None,
+    tokens_per_frame: int | None = None,
+) -> dict[str, Any]:
+    """Bucket teacher-forced argmax-mismatch counts by codec hierarchy level.
+
+    Unlike ``analyze_codebook_divergence`` (which diffs free-run sampled token
+    streams and is subject to autoregressive drift once the two runs disagree),
+    this uses the deterministic per-step ``argmax_mismatch`` flags produced by
+    ``compare_distributions`` in ``decoding/distribution.py`` — each step's slot
+    (``step % tokens_per_frame``) maps to a hierarchy level exactly like
+    ``analyze_codebook_divergence`` does for the free-run comparison.
+    """
+    spec = get_codec_spec(model_name=model_name, family=codec_family, tokens_per_frame=tokens_per_frame)
+    hierarchy = spec.hierarchy or {"coarse": [0]}
+
+    totals = {level: {"mismatched": 0, "total": 0} for level in hierarchy}
+    for entry in dist_per_sample:
+        mismatches = (entry.get("per_step") or {}).get("argmax_mismatch") or []
+        for step, mismatch in enumerate(mismatches):
+            slot = step % spec.tokens_per_frame
+            for level, positions in hierarchy.items():
+                if slot in positions:
+                    totals[level]["total"] += 1
+                    if mismatch:
+                        totals[level]["mismatched"] += 1
+                    break
+
+    total_mismatched = sum(v["mismatched"] for v in totals.values())
+    total_tokens = sum(v["total"] for v in totals.values())
+
+    return {
+        "codec_family": spec.family,
+        "tokens_per_frame": spec.tokens_per_frame,
+        "total_tokens": total_tokens,
+        "total_mismatched": total_mismatched,
+        "overall_rate": (total_mismatched / total_tokens) if total_tokens else None,
+        "by_hierarchy": {
+            level: {
+                "mismatched": v["mismatched"],
+                "total": v["total"],
+                "rate": (v["mismatched"] / v["total"]) if v["total"] else None,
+            }
+            for level, v in totals.items()
+        },
+    }
+
+
 __all__ = [
     "CodecSpec",
     "CodebookDivergenceAnalyzer",
     "analyze_codebook_divergence",
     "detect_codec_family",
     "get_codec_spec",
+    "teacher_forced_hierarchy_divergence",
 ]

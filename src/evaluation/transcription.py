@@ -19,14 +19,23 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import torch
-from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from transformers.audio_utils import load_audio
+
+try:
+    from transformers import CohereAsrForConditionalGeneration
+except ImportError:
+    # Not available on older transformers pins (e.g. .venv-qwen's 4.57.3, used for
+    # QwenTTSModel). load_asr_model() falls back to Qwen3-ASR in that case.
+    CohereAsrForConditionalGeneration = None
 
 
 DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
+# Used automatically when CohereAsrForConditionalGeneration can't be imported/loaded.
+FALLBACK_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
 DEFAULT_SAMPLE_RATE = 16000
 
 _normalizer = None  # lazy singleton: NeMo grammar construction takes ~30s
@@ -134,72 +143,129 @@ def find_audio_files(directory: Path) -> list[Path]:
     return sorted(wavs, key=lambda p: p.name)
 
 
+def _transcribe_batch_cohere(
+    model,
+    processor,
+    audios: list,
+    sampling_rate: int,
+    language: str,
+) -> list[str]:
+    inputs = processor(
+        audios,
+        sampling_rate=sampling_rate,
+        return_tensors="pt",
+        language=language,
+    )
+
+    audio_chunk_index = inputs.get("audio_chunk_index")
+    inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float32))
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=256,
+        )
+
+    texts = processor.decode(
+        outputs,
+        skip_special_tokens=True,
+        audio_chunk_index=audio_chunk_index,
+        language=language,
+    )
+    return texts if isinstance(texts, list) else [texts]
+
+
+def _transcribe_batch_qwen_asr(
+    model,
+    processor,
+    audios: list,
+    language: str,
+) -> list[str]:
+    inputs = processor.apply_transcription_request(audio=audios, language=language)
+    inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float32))
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, max_new_tokens=256)
+
+    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+    # decode()/parse_output() assume a single sequence for 2D batches; batch_decode +
+    # extract_transcription is the batch-safe path (both explicitly accept list[str]).
+    raw_texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    texts = processor.extract_transcription(raw_texts)
+    return texts if isinstance(texts, list) else [texts]
+
+
 def transcribe_batch(
-    model: CohereAsrForConditionalGeneration,
+    model,
     processor,
     audio_paths: Sequence[Path],
     batch_size: int,
     sampling_rate: int = DEFAULT_SAMPLE_RATE,
     language: str = "en",
 ) -> list[str]:
-    """Batch-transcribe a list of audio files using the Cohere ASR model."""
+    """Batch-transcribe a list of audio files using the loaded ASR model (Cohere or the
+    Qwen3-ASR fallback, dispatched by the model's actual class)."""
     if not audio_paths:
         return []
+
+    is_qwen_asr = type(model).__name__.startswith("Qwen3ASR")
 
     results: list[str] = []
     for start in range(0, len(audio_paths), batch_size):
         chunk = audio_paths[start : start + batch_size]
         audios = [load_audio(str(path), sampling_rate=sampling_rate) for path in chunk]
-        inputs = processor(
-            audios,
-            sampling_rate=sampling_rate,
-            return_tensors="pt",
-            language=language,
-        )
-
-        audio_chunk_index = inputs.get("audio_chunk_index")
-        inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float32))
-
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-            )
-
-        texts = processor.decode(
-            outputs,
-            skip_special_tokens=True,
-            audio_chunk_index=audio_chunk_index,
-            language=language,
-        )
-
-        if isinstance(texts, list):
-            results.extend(texts)
+        if is_qwen_asr:
+            results.extend(_transcribe_batch_qwen_asr(model, processor, audios, language=language))
         else:
-            results.append(texts)
+            results.extend(
+                _transcribe_batch_cohere(model, processor, audios, sampling_rate=sampling_rate, language=language)
+            )
 
     return results
 
 
-def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
-    """Load the Cohere ASR processor/model pair with the correct dtype for the runtime."""
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = CohereAsrForConditionalGeneration.from_pretrained(
-        model_name,
-        device_map=device_map,
-        torch_dtype=(
-            torch.bfloat16
-            if (torch.xpu.is_available() or torch.cuda.is_available())
-            else torch.float32
-        ),
-    )
+def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto", fallback_model: str = FALLBACK_MODEL):
+    """Load the Cohere ASR processor/model pair, falling back to Qwen3-ASR when
+    CohereAsrForConditionalGeneration isn't importable (older transformers pins,
+    e.g. .venv-qwen's 4.57.3) or fails to load.
+
+    HF/accelerate's device_map="auto" dispatch doesn't reliably detect Intel XPU and
+    silently falls back to CPU (dramatically slower for a model this size), so pin an
+    available accelerator explicitly instead — same {"": device} workaround already
+    used in quants/quantizer.py for the same reason.
+    """
+    if device_map == "auto":
+        if torch.xpu.is_available():
+            device_map = {"": "xpu"}
+        elif torch.cuda.is_available():
+            device_map = {"": "cuda"}
+
+    torch_dtype = torch.bfloat16 if (torch.xpu.is_available() or torch.cuda.is_available()) else torch.float32
+
+    if CohereAsrForConditionalGeneration is not None:
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+            model = CohereAsrForConditionalGeneration.from_pretrained(
+                model_name, device_map=device_map, torch_dtype=torch_dtype
+            )
+            return processor, model
+        except Exception as e:
+            print(f"[load_asr_model] Failed to load Cohere ASR model {model_name!r} ({e}); falling back to {fallback_model!r}.")
+    else:
+        print(
+            f"[load_asr_model] CohereAsrForConditionalGeneration not importable in this transformers "
+            f"install; falling back to {fallback_model!r}."
+        )
+
+    processor = AutoProcessor.from_pretrained(fallback_model)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(fallback_model, device_map=device_map, torch_dtype=torch_dtype)
     return processor, model
 
 
 def evaluate_transcription_run(
     run_dir: Path,
     prompts: Sequence[str],
-    asr_model: CohereAsrForConditionalGeneration,
+    asr_model: Any,
     processor,
     batch_size: int,
     sampling_rate: int = DEFAULT_SAMPLE_RATE,
@@ -248,7 +314,7 @@ def evaluate_transcription_run(
 def evaluate_quant_dir(
     quant_dir: Path,
     prompts: Sequence[str],
-    model: CohereAsrForConditionalGeneration,
+    model: Any,
     processor,
     batch_size: int,
     sampling_rate: int = DEFAULT_SAMPLE_RATE,

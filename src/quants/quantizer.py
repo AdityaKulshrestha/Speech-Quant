@@ -130,3 +130,4 @@ def quantize_model(
         device_map=load_device_map,
     )
     return gptq_model.model
+

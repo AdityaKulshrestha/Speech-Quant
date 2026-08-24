@@ -4,31 +4,37 @@ Teacher-forced distribution analysis for baseline vs quantized TTS models.
 Core idea
 ---------
 Free-running comparison confounds two effects: quantization error at step t AND
-the shifted context caused by all prior mispredictions. Teacher forcing on the
-FP16 reference sequence breaks the conflation: both models receive the same
-prefix at every step, so differences in the output distribution are purely due
-to quantization.
+the shifted context caused by all prior mispredictions. Teacher forcing one
+model on the OTHER model's own reference sequence breaks the conflation: both
+models effectively see the same prefix at every step, so differences in the
+output distribution are attributable to quantization rather than drift.
+
+evaluate.py's `teacher_forced_distribution_compare()` forces the QUANTIZED
+model's own free-run token sequence through the FULL-PRECISION baseline model
+(one forward pass, no autoregressive loop) — measuring how well the reference
+model "endorses" what quantization actually produced.
 
 Workflow
 --------
-    # 1. FP16 free run (existing flow) — audio_logits are already teacher-forced
-    #    on its own sequence, so no re-run is needed for the baseline.
-    baseline_out = fp16_model.generate_tokens(inputs)
+    # 1. Quantized model free run (existing flow) — audio_logits are already
+    #    teacher-forced on its own sequence, so no re-run is needed for it.
+    quant_out = quant_model.generate_tokens(inputs)
 
-    # 2. Quantized model — teacher-forced on the FP16 reference sequence.
-    #    token_filter and vocab_slice are model-specific; pass None to collect
-    #    every generated token over the full vocabulary.
+    # 2. Baseline (full-precision) model — teacher-forced on the quantized
+    #    model's reference sequence. token_filter and vocab_slice are
+    #    model-specific; pass None to collect every generated token over the
+    #    full vocabulary.
     #
     #    Orpheus example:
     #      audio_start = OrpheusTTS.AUDIO_TOKEN_START
     #      audio_end   = audio_start + OrpheusTTS.TOKENS_PER_FRAME * OrpheusTTS.CODEBOOK_SIZE
     #      token_filter = lambda t: audio_start <= t < audio_end
     #      vocab_slice  = (audio_start, audio_end)
-    quant_probs, _token_ids = extract_teacher_forced_logits(
-        model=quant_model.model,
-        reference_ids=baseline_out.generated_ids,
+    baseline_probs, _token_ids = extract_teacher_forced_logits(
+        model=baseline_model.model,
+        reference_ids=quant_out.generated_ids,
         eos_token_id=OrpheusTTS.END_OF_SPEECH,
-        prompt_length=baseline_out.metadata["input_length"],
+        prompt_length=quant_out.metadata["input_length"],
         token_filter=lambda t: audio_start <= t < audio_end,
         vocab_slice=(audio_start, audio_end),
         tokens_per_frame=OrpheusTTS.TOKENS_PER_FRAME,
@@ -37,8 +43,8 @@ Workflow
     # 3. Compare distributions; pass tokens_per_frame only for codecs that
     #    interleave multiple codec levels per frame (e.g. Orpheus/SNAC).
     results = compare_distributions(
-        baseline_probs=baseline_out.audio_logits.float(),
-        quant_probs=quant_probs,
+        baseline_probs=baseline_probs,
+        quant_probs=quant_out.audio_logits.float(),
         tokens_per_frame=OrpheusTTS.TOKENS_PER_FRAME,
     )
 """
@@ -198,11 +204,13 @@ def compare_distributions(
     at different granularities. Omit for single-token-per-step models.
 
     Args:
-        baseline_probs: [T, V] float32 — reference softmax probs.
-            For the FP16 model, pass GenerationOutput.audio_logits directly;
-            its free-run logits are equivalent to teacher-forced logits because
-            the reference sequence IS the FP16 model's own output.
-        quant_probs:    [T, V] float32 — from extract_teacher_forced_logits().
+        baseline_probs: [T, V] float32 — from extract_teacher_forced_logits(),
+            i.e. the model being scored via teacher forcing on the OTHER
+            model's reference sequence.
+        quant_probs:    [T, V] float32 — reference softmax probs, straight from
+            the reference model's own free-run generation (its free-run logits
+            are equivalent to teacher-forced logits on itself, since the
+            reference sequence IS that model's own output).
         tokens_per_frame: bucket by frame position when set (e.g. 7 for
             Orpheus/SNAC). Pass None (default) for flat / single-token models.
         topk: neighbourhood size for Jaccard overlap metric.
@@ -271,9 +279,33 @@ def compare_distributions(
     }
 
 
+def first_token_divergence_rate(dist_per_sample: list[dict[str, Any]]) -> float | None:
+    """METRICS.md's First Token Divergence Rate (FTDR): fraction of samples whose very
+    first teacher-forced audio token already has a greedy-argmax mismatch.
+
+    Each ``dist_per_sample`` entry is one ``compare_distributions()`` result (from
+    ``teacher_forced_distribution_compare`` in evaluate.py); ``per_step["argmax_mismatch"]``
+    is a deterministic argmax comparison (baseline's own predicted token vs. the quant
+    model's teacher-forced prediction), so this is unconfounded by sampling randomness
+    or autoregressive drift — unlike the free-run ``first_divergence_position`` in
+    evaluation/metrics.py, which can land much later purely because a lucky sampled
+    draw happened to still agree after the underlying distributions already diverged.
+    """
+    diverged_first: list[bool] = []
+    for entry in dist_per_sample:
+        mismatches = (entry.get("per_step") or {}).get("argmax_mismatch") or []
+        if mismatches:
+            diverged_first.append(bool(mismatches[0]))
+
+    if not diverged_first:
+        return None
+    return sum(diverged_first) / len(diverged_first)
+
+
 __all__ = [
     "compare_distributions",
     "extract_teacher_forced_logits",
+    "first_token_divergence_rate",
     "js_divergence_sequence",
     "topk_overlap_sequence",
 ]

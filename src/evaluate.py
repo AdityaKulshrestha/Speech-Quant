@@ -15,6 +15,7 @@ workbook at <output-dir>/evaluation/analysis_report.xlsx.
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -36,12 +37,15 @@ from evaluation.metrics import (
     codebook_ids_for_tokens,
     compare_sequences,
     kl_divergence_sequence,
+    negative_log_likelihood,
     probability_difference,
     summarize_scores,
 )
 from models.orpheus_model import OrpheusTTS
 from models.neutts_model import NeuTTSModel
 from models.qwentts_model import QwenTTSModel
+from models.outetts_model import OuteTTSModel
+from models.llasa_model import LlasaModel
 from quants.config import QUANT_CONFIGS
 from visualization.heatmap import (
     save_codebook_heatmap,
@@ -56,6 +60,8 @@ MODEL_REGISTRY = {
     "orpheus": OrpheusTTS,
     "neutts": NeuTTSModel,
     "qwen": QwenTTSModel,
+    "outetts": OuteTTSModel,
+    "llasa": LlasaModel,
 }
 
 
@@ -105,7 +111,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--voice",
         default="tara",
-        help="Speaker/voice tag (Orpheus: voice style; NeuTTS: emily/paul/sophie/steven).",
+        help=(
+            "Speaker/voice tag (Orpheus: voice style; NeuTTS: emily/paul/sophie/steven; "
+            "OuteTTS/Llasa: unused, zero-shot only)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -186,21 +195,21 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
 
     manifest = []
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.xpu.manual_seed_all(args.seed)
-
     torch.use_deterministic_algorithms(True)
-    torch.manual_seed(args.seed)
-    set_seed(args.seed)
 
     for idx, text in enumerate(prompts):
         sample_id = f"sample_{idx:03d}"
         print(f"[{run_dir.name}/{sample_id}] Generating: {text!r}")
 
-        # Reset the seed per sample so the baseline and quantized runs
-        # draw the same random numbers for a fair token-level comparison.
+        # Reset the seed per sample (not just once before the loop) so the
+        # baseline and quantized runs draw the same random numbers at every
+        # sample, not only the first.
+        sample_seed = args.seed + idx
+        random.seed(sample_seed)
+        np.random.seed(sample_seed)
+        torch.manual_seed(sample_seed)
+        torch.xpu.manual_seed_all(sample_seed)
+        set_seed(sample_seed)
 
         synchronize(args.device)
         start = time.perf_counter()
@@ -306,32 +315,40 @@ def compare_runs(baseline_manifest: list[dict], quant_manifest: list[dict]) -> l
 
 
 def teacher_forced_distribution_compare(
-    baseline_manifest: list[dict],
-    quant_model,
+    quant_manifest: list[dict],
+    baseline_model,
 ) -> list[dict]:
-    """Re-run the quantized model on FP16 reference sequences for clean per-position
-    distribution metrics without sequence-drift contamination.
+    """Re-run the FULL-PRECISION baseline model on the QUANTIZED model's own
+    free-run generated sequences, for clean per-position distribution metrics
+    without sequence-drift contamination.
+
+    This is the direction that measures quantization impact on generation
+    quality: it asks "how well does the reference model endorse what the
+    quantized model actually chose to say", by teacher-forcing the quant
+    model's own reference token sequence through the baseline model in a
+    single forward pass.
 
     Each per-sample result also carries step-level detail (aligned with
-    result["per_step"]): the baseline's actual (reference) token at each step,
-    the quant model's own predicted (argmax) token at that same step, and each
-    model's probability of the reference token — so callers can build a full
+    result["per_step"]): the quant model's actual (reference) token at each
+    step, the baseline model's own predicted (argmax) token at that same step,
+    each model's probability of the reference token, and the corresponding
+    per-step negative log-likelihood (NLL) — so callers can build a full
     row-level table instead of only frame-bucketed summaries.
     """
     _required = ("model", "AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
-    if not all(hasattr(quant_model, a) for a in _required):
+    if not all(hasattr(baseline_model, a) for a in _required):
         return []
 
     # VOCAB_AUDIO_TOKEN_START is the real tokenizer-vocab offset of the audio/codec
     # token block; AUDIO_TOKEN_START may instead be relative to an already
     # de-offset token representation (e.g. NeuTTS's regex-extracted audio_tokens).
-    audio_start = getattr(quant_model, "VOCAB_AUDIO_TOKEN_START", None)
+    audio_start = getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None)
     if audio_start is None:
-        audio_start = quant_model.AUDIO_TOKEN_START
-    audio_end = audio_start + quant_model.TOKENS_PER_FRAME * quant_model.CODEBOOK_SIZE
+        audio_start = baseline_model.AUDIO_TOKEN_START
+    audio_end = audio_start + baseline_model.TOKENS_PER_FRAME * baseline_model.CODEBOOK_SIZE
     per_sample = []
 
-    for entry in baseline_manifest:
+    for entry in quant_manifest:
         gids_path = entry.get("generated_ids_path")
         probs_path = entry.get("audio_probs_path")
         if not gids_path or not probs_path:
@@ -339,34 +356,43 @@ def teacher_forced_distribution_compare(
         if not Path(gids_path).exists() or not Path(probs_path).exists():
             continue
 
-        reference_ids = torch.load(gids_path, map_location=quant_model.device, weights_only=True)
-        baseline_probs = torch.from_numpy(np.load(probs_path)).float()
+        reference_ids = torch.load(gids_path, map_location=baseline_model.device, weights_only=True)
+        quant_probs = torch.from_numpy(np.load(probs_path)).float()
 
-        quant_probs, token_ids = extract_teacher_forced_logits(
-            model=quant_model.model,
+        baseline_probs, token_ids = extract_teacher_forced_logits(
+            model=baseline_model.model,
             reference_ids=reference_ids,
-            eos_token_id=quant_model.END_OF_SPEECH,
+            eos_token_id=baseline_model.END_OF_SPEECH,
             prompt_length=entry["input_length"],
             token_filter=lambda t: audio_start <= t < audio_end,
             vocab_slice=(audio_start, audio_end),
-            tokens_per_frame=quant_model.TOKENS_PER_FRAME,
+            tokens_per_frame=baseline_model.TOKENS_PER_FRAME,
         )
 
         result = compare_distributions(
             baseline_probs=baseline_probs,
             quant_probs=quant_probs,
-            tokens_per_frame=quant_model.TOKENS_PER_FRAME,
+            tokens_per_frame=baseline_model.TOKENS_PER_FRAME,
         )
 
         # step_* arrays line up 1:1 with result["per_step"]'s kl/js/argmax_mismatch lists.
         n = min(len(baseline_probs), len(quant_probs), len(token_ids))
         offsets = (token_ids[:n] - audio_start).long()
         idx = torch.arange(n)
-        quant_argmax = quant_probs[:n].argmax(dim=-1)
-        result["step_baseline_token_id"] = token_ids[:n].tolist()
-        result["step_quant_token_id"] = (quant_argmax + audio_start).tolist()
-        result["step_baseline_prob"] = baseline_probs[:n][idx, offsets].tolist()
-        result["step_quant_prob"] = quant_probs[:n][idx, offsets].tolist()
+        baseline_argmax = baseline_probs[:n].argmax(dim=-1)
+        result["step_baseline_token_id"] = (baseline_argmax + audio_start).tolist()
+        result["step_quant_token_id"] = token_ids[:n].tolist()
+        step_baseline_prob = baseline_probs[:n][idx, offsets]
+        step_quant_prob = quant_probs[:n][idx, offsets]
+        result["step_baseline_prob"] = step_baseline_prob.tolist()
+        result["step_quant_prob"] = step_quant_prob.tolist()
+        result["step_baseline_nll"] = negative_log_likelihood(step_baseline_prob).tolist()
+        result["step_quant_nll"] = negative_log_likelihood(step_quant_prob).tolist()
+        if n:
+            result["summary"]["mean_nll_baseline"] = float(sum(result["step_baseline_nll"]) / n)
+            result["summary"]["mean_nll_quant"] = float(sum(result["step_quant_nll"]) / n)
+            result["summary"]["perplexity_baseline"] = math.exp(result["summary"]["mean_nll_baseline"])
+            result["summary"]["perplexity_quant"] = math.exp(result["summary"]["mean_nll_quant"])
 
         result["sample_id"] = entry["sample_id"]
         result["text"] = entry["text"]
@@ -419,8 +445,14 @@ def run_experiment(args: argparse.Namespace) -> None:
     quant_model = build_model(args, quant_type=args.quant_type)
     quant_model.load()
     quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
-    dist_per_sample = teacher_forced_distribution_compare(baseline_manifest, quant_model)
     quant_model.unload()
+
+    # Teacher-force the quant model's own free-run output through the reloaded
+    # full-precision baseline model (one model resident at a time) to measure
+    # how well the reference model endorses what quantization actually produced.
+    baseline_model.load()
+    dist_per_sample = teacher_forced_distribution_compare(quant_manifest, baseline_model)
+    baseline_model.unload()
 
     per_sample_scores = compare_runs(baseline_manifest, quant_manifest)
     summary = summarize_scores(per_sample_scores)

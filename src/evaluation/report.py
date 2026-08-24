@@ -33,6 +33,8 @@ import pandas as pd
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
+from decoding.alignment import teacher_forced_hierarchy_divergence
+from decoding.distribution import first_token_divergence_rate as compute_first_token_divergence_rate
 from evaluation.metrics import codebook_ids_for_tokens
 
 PER_SAMPLE_SHEET = "PerSample"
@@ -70,6 +72,8 @@ def _summary_rows(
     codebook_summary: dict[str, Any],
     baseline_transcription: dict[str, Any],
     quant_transcription: dict[str, Any],
+    first_token_divergence_rate: float | None,
+    teacher_forced_hierarchy: dict[str, Any],
 ) -> pd.DataFrame:
     metrics: dict[str, Any] = {
         "baseline_wer": baseline_transcription.get("mean_wer"),
@@ -79,7 +83,7 @@ def _summary_rows(
         "mean_mcd": acoustics_summary.get("mean_mcd"),
         "mean_f0_frame_error": acoustics_summary.get("mean_f0_frame_error"),
         "mean_pitch_pearson_correlation": acoustics_summary.get("mean_pitch_pearson_correlation"),
-        "mean_first_divergence_position": scores_summary.get("mean_first_divergence_position"),
+        "first_token_divergence_rate": first_token_divergence_rate,
         "mean_final_divergence_rate": scores_summary.get("mean_final_divergence_rate"),
         "mean_prob_difference": scores_summary.get("mean_prob_difference"),
         "mean_kl_divergence": scores_summary.get("mean_kl_divergence"),
@@ -89,9 +93,20 @@ def _summary_rows(
         metrics["teacher_forced_mean_kl"] = dist_summary.get("mean_kl")
         metrics["teacher_forced_mean_js"] = dist_summary.get("mean_js")
         metrics["teacher_forced_argmax_mismatch_rate"] = dist_summary.get("argmax_mismatch_rate")
+        metrics["teacher_forced_mean_nll_baseline"] = dist_summary.get("mean_nll_baseline")
+        metrics["teacher_forced_mean_nll_quant"] = dist_summary.get("mean_nll_quant")
+        metrics["teacher_forced_perplexity_baseline"] = dist_summary.get("perplexity_baseline")
+        metrics["teacher_forced_perplexity_quant"] = dist_summary.get("perplexity_quant")
         for key, value in dist_summary.items():
             if key.startswith("mean_top") and key.endswith("_jaccard"):
                 metrics[f"teacher_forced_{key}"] = value
+        # Teacher-forced (deterministic argmax) mismatch counts per codebook hierarchy
+        # level, distinct from the free-run `codebook_{level}_rate` below.
+        metrics["teacher_forced_codebook_total_mismatched_tokens"] = teacher_forced_hierarchy.get("total_mismatched")
+        metrics["teacher_forced_codebook_total_tokens"] = teacher_forced_hierarchy.get("total_tokens")
+        for level, payload in (teacher_forced_hierarchy.get("by_hierarchy") or {}).items():
+            metrics[f"teacher_forced_codebook_{level}_mismatched_tokens"] = payload.get("mismatched")
+            metrics[f"teacher_forced_codebook_{level}_rate"] = payload.get("rate")
     for level, payload in (codebook_summary.get("by_hierarchy") or {}).items():
         metrics[f"codebook_{level}_rate"] = payload.get("mean_rate")
 
@@ -156,9 +171,11 @@ def _logprobs_kl_rows(
     """One row per teacher-forced generation step (not bucketed by codec level).
 
     baseline/quant token ids and probs are kept adjacent so they're directly
-    comparable: baseline_* is the actual reference token and the baseline
-    model's own probability of it; quant_* is the quantized model's argmax
-    prediction at that same step and its probability of the reference token.
+    comparable: quant_* is the quant model's own actual (reference) token and
+    its own free-run probability of it; baseline_* is the full-precision
+    model's argmax prediction at that same step and its probability of the
+    quant-chosen token (via teacher forcing on the quant model's sequence).
+    nll_baseline/nll_quant are the corresponding -log(prob) values.
     """
     rows = []
     for entry in dist_per_sample:
@@ -172,6 +189,8 @@ def _logprobs_kl_rows(
         quant_token_ids = entry.get("step_quant_token_id") or []
         baseline_prob = entry.get("step_baseline_prob") or []
         quant_prob = entry.get("step_quant_prob") or []
+        baseline_nll = entry.get("step_baseline_nll") or []
+        quant_nll = entry.get("step_quant_nll") or []
         kl = per_step.get("kl") or []
         js = per_step.get("js") or []
         argmax_mismatch = per_step.get("argmax_mismatch") or []
@@ -180,7 +199,7 @@ def _logprobs_kl_rows(
 
         n = min(
             len(baseline_token_ids), len(quant_token_ids), len(baseline_prob), len(quant_prob),
-            len(kl), len(js), len(argmax_mismatch),
+            len(baseline_nll), len(quant_nll), len(kl), len(js), len(argmax_mismatch),
         )
         codebook_ids = codebook_ids_for_tokens(n, tokens_per_frame=tokens_per_frame)
 
@@ -205,6 +224,8 @@ def _logprobs_kl_rows(
                     ),
                     "baseline_prob": baseline_prob[step],
                     "quant_prob": quant_prob[step],
+                    "nll_baseline": baseline_nll[step],
+                    "nll_quant": quant_nll[step],
                     "kl": kl[step],
                     "js": js[step],
                     "argmax_match": not bool(argmax_mismatch[step]),
@@ -266,11 +287,16 @@ def update_report(
     """Upsert one (model, quant_type) run's results into the shared report workbook."""
     codebook_summary = codebook_divergence.get("summary", {})
     codebook_per_sample = codebook_divergence.get("per_sample", [])
+    ftdr = compute_first_token_divergence_rate(dist_per_sample)
+    teacher_forced_hierarchy = teacher_forced_hierarchy_divergence(
+        dist_per_sample, model_name=model, tokens_per_frame=dist_summary.get("tokens_per_frame"),
+    )
 
     summary_long = _upsert(
         _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"]),
         _summary_rows(model, quant_type, scores_summary, dist_summary, acoustics_summary,
-                      codebook_summary, baseline_transcription, quant_transcription),
+                      codebook_summary, baseline_transcription, quant_transcription,
+                      ftdr, teacher_forced_hierarchy),
         model, quant_type,
     )
     per_sample = _upsert(

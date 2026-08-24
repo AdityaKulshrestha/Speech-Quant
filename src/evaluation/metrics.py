@@ -59,6 +59,11 @@ def kl_divergence_sequence(
     return (p * (p / q).log()).sum(dim=-1).tolist()
 
 
+def negative_log_likelihood(token_probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Per-position NLL = -log(prob of the chosen/reference token)."""
+    return -token_probs.clamp(min=eps).log()
+
+
 
 def first_divergence_position(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor) -> int | None:
     """Index of the first mismatched token, or None if the compared span matches fully."""
