@@ -75,6 +75,26 @@ def _summary_rows(
     first_token_divergence_rate: float | None,
     teacher_forced_hierarchy: dict[str, Any],
 ) -> pd.DataFrame:
+    # Load model size stats if available
+    model_size_mb = None
+    compression_ratio = None
+    if quant_type != "none":
+        try:
+            from pathlib import Path
+            quant_store = Path(__file__).parents[2] / "quant_models"
+            # Build cache path: model_slug__quant_type
+            import re
+            slug = re.sub(r"[/\\:]+", "--", model.strip("/\\"))
+            slug = re.sub(r"[\s.]+", "-", slug).strip("-")
+            cache_dir = quant_store / f"{slug}__{quant_type}"
+            stats_file = cache_dir / "quant_stats.json"
+            if stats_file.exists():
+                stats = json.loads(stats_file.read_text())
+                model_size_mb = stats.get("quant_size_mb")
+                compression_ratio = stats.get("compression_ratio")
+        except Exception:
+            pass  # Stats not available
+
     metrics: dict[str, Any] = {
         "baseline_wer": baseline_transcription.get("mean_wer"),
         "baseline_cer": baseline_transcription.get("mean_cer"),
@@ -83,6 +103,11 @@ def _summary_rows(
         "mean_mcd": acoustics_summary.get("mean_mcd"),
         "mean_f0_frame_error": acoustics_summary.get("mean_f0_frame_error"),
         "mean_pitch_pearson_correlation": acoustics_summary.get("mean_pitch_pearson_correlation"),
+        "mean_utmos_baseline": acoustics_summary.get("mean_utmos_baseline"),
+        "mean_utmos_quant": acoustics_summary.get("mean_utmos_quant"),
+        "utmos_degradation": acoustics_summary.get("utmos_degradation"),
+        "model_size_mb": model_size_mb,
+        "compression_ratio": compression_ratio,
         "first_token_divergence_rate": first_token_divergence_rate,
         "mean_final_divergence_rate": scores_summary.get("mean_final_divergence_rate"),
         "mean_prob_difference": scores_summary.get("mean_prob_difference"),
@@ -150,7 +175,9 @@ def _per_sample_rows(
                 "mcd": acoustics.get("mcd"),
                 "f0_frame_error": acoustics.get("f0_frame_error"),
                 "pitch_pearson_correlation": acoustics.get("pitch_pearson_correlation"),
-                "first_divergence_position": score.get("first_divergence_position"),
+                "utmos_baseline": acoustics.get("utmos_baseline"),
+                "utmos_quant": acoustics.get("utmos_quant"),
+                "first_sampled_mismatch_position": score.get("first_sampled_mismatch_position"),
                 "final_divergence_rate": score.get("final_divergence_rate"),
                 "mean_prob_difference": score.get("mean_prob_difference"),
                 "mean_kl_divergence": score.get("mean_kl_divergence"),

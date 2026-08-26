@@ -7,7 +7,6 @@ prompt.
 Extended metrics:
   - codebook_ids_for_tokens: maps flat token positions to SNAC codebook (0/1/2)
   - probability_difference: per-position baseline_prob - quant_prob for chosen token
-  - kl_divergence_sequence: per-position KL(P_baseline || P_quant) over audio subspace
 """
 
 import torch
@@ -47,27 +46,21 @@ def probability_difference(
     return diffs
 
 
-def kl_divergence_sequence(
-    baseline_probs: torch.Tensor,
-    quant_probs: torch.Tensor,
-    eps: float = 1e-8,
-) -> list[float]:
-    """Per-position KL(P_baseline || P_quant) over the audio token subspace."""
-    n = min(len(baseline_probs), len(quant_probs))
-    p = baseline_probs[:n].float().clamp(min=eps)
-    q = quant_probs[:n].float().clamp(min=eps)
-    return (p * (p / q).log()).sum(dim=-1).tolist()
-
-
 def negative_log_likelihood(token_probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Per-position NLL = -log(prob of the chosen/reference token)."""
     return -token_probs.clamp(min=eps).log()
 
 
 
-def first_divergence_position(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor) -> int | None:
-    """Index of the first mismatched token, or None if the compared span matches fully."""
+def first_sampled_mismatch_position(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor) -> int | None:
+    """Index of the first sampled token mismatch in free-run generation.
 
+    Note: This is affected by both quantization error and autoregressive drift.
+    For the drift-free FTDR metric, see decoding.distribution.first_token_divergence_rate().
+
+    Returns:
+        Position of first mismatch, or None if sequences match
+    """
     n = min(baseline_tokens.numel(), quant_tokens.numel())
     mismatches = (baseline_tokens[:n] != quant_tokens[:n]).nonzero(as_tuple=True)[0]
 
@@ -93,7 +86,7 @@ def cumulative_divergence_rate(baseline_tokens: torch.Tensor, quant_tokens: torc
 
 
 def compare_sequences(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor) -> dict:
-    """FDP + D(t) summary for one baseline/quantized token-sequence pair."""
+    """Free-run sequence comparison (first mismatch + D(t) divergence curve)."""
 
     divergence_curve = cumulative_divergence_rate(baseline_tokens, quant_tokens)
 
@@ -101,24 +94,24 @@ def compare_sequences(baseline_tokens: torch.Tensor, quant_tokens: torch.Tensor)
         "baseline_length": baseline_tokens.numel(),
         "quant_length": quant_tokens.numel(),
         "compared_length": min(baseline_tokens.numel(), quant_tokens.numel()),
-        "first_divergence_position": first_divergence_position(baseline_tokens, quant_tokens),
+        "first_sampled_mismatch_position": first_sampled_mismatch_position(baseline_tokens, quant_tokens),
         "final_divergence_rate": divergence_curve[-1] if divergence_curve else None,
         "divergence_curve": divergence_curve,
     }
 
 
 def summarize_scores(per_sample: list[dict]) -> dict:
-    """Aggregate FDP/D(t)/prob-diff/KL across samples for the final score block."""
+    """Aggregate free-run metrics (first mismatch, D(t), prob-diff, KL) across samples."""
 
-    fdps = [s["first_divergence_position"] for s in per_sample if s["first_divergence_position"] is not None]
-    finals = [s["final_divergence_rate"] for s in per_sample if s["final_divergence_rate"] is not None]
+    fdps = [s["first_sampled_mismatch_position"] for s in per_sample if s.get("first_sampled_mismatch_position") is not None]
+    finals = [s["final_divergence_rate"] for s in per_sample if s.get("final_divergence_rate") is not None]
     mean_pdiffs = [s["mean_prob_difference"] for s in per_sample if s.get("mean_prob_difference") is not None]
     mean_kls = [s["mean_kl_divergence"] for s in per_sample if s.get("mean_kl_divergence") is not None]
 
     return {
         "num_samples": len(per_sample),
         "num_samples_with_divergence": len(fdps),
-        "mean_first_divergence_position": sum(fdps) / len(fdps) if fdps else None,
+        "mean_first_sampled_mismatch_position": sum(fdps) / len(fdps) if fdps else None,
         "mean_final_divergence_rate": sum(finals) / len(finals) if finals else 0.0,
         "mean_prob_difference": sum(mean_pdiffs) / len(mean_pdiffs) if mean_pdiffs else None,
         "mean_kl_divergence": sum(mean_kls) / len(mean_kls) if mean_kls else None,

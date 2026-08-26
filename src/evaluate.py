@@ -25,7 +25,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-import triton.language  # noqa: F401 - torch._dynamo expects triton.language to be attached.
 from transformers import set_seed
 
 from decoding.alignment import CodebookDivergenceAnalyzer, detect_codec_family
@@ -35,7 +34,6 @@ from evaluation.report import update_report
 from evaluation.metrics import (
     codebook_ids_for_tokens,
     compare_sequences,
-    kl_divergence_sequence,
     negative_log_likelihood,
     probability_difference,
     summarize_scores,
@@ -342,7 +340,12 @@ def compare_runs(baseline_manifest: list[dict], quant_manifest: list[dict]) -> l
             offsets = (baseline_tokens - ats).long()
 
             pdiff = probability_difference(b_probs, q_probs, offsets)
-            kl_vals = kl_divergence_sequence(b_probs, q_probs)
+
+            # KL divergence: inlined to avoid duplication with distribution.py
+            n = min(len(b_probs), len(q_probs))
+            p = b_probs[:n].float().clamp(min=1e-8)
+            q = q_probs[:n].float().clamp(min=1e-8)
+            kl_vals = (p * (p / q).log()).sum(dim=-1).tolist()
 
             score["prob_difference"] = pdiff
             score["mean_prob_difference"] = sum(pdiff) / len(pdiff) if pdiff else 0.0
@@ -355,58 +358,74 @@ def compare_runs(baseline_manifest: list[dict], quant_manifest: list[dict]) -> l
 
 
 def teacher_forced_distribution_compare(
+    baseline_manifest: list[dict],
     quant_manifest: list[dict],
     baseline_model,
+    quant_model,
 ) -> list[dict]:
-    """Re-run the FULL-PRECISION baseline model on the QUANTIZED model's own
-    free-run generated sequences, for clean per-position distribution metrics
-    without sequence-drift contamination.
+    """Teacher-forced distribution comparison: isolates pure quantization error.
 
-    This is the direction that measures quantization impact on generation
-    quality: it asks "how well does the reference model endorse what the
-    quantized model actually chose to say", by teacher-forcing the quant
-    model's own reference token sequence through the baseline model in a
-    single forward pass.
+    Correct order (per arXiv:2405.02404 "Statistically-Lossless Quantization"):
+        1. Full-precision (baseline) model generates freely → produces reference sequence
+        2. Freeze that reference sequence
+        3. Quantized model is teacher-forced on the frozen sequence
+        4. Compute D_KL(P_baseline || P_quant) at each position
 
-    Each per-sample result also carries step-level detail (aligned with
-    result["per_step"]): the quant model's actual (reference) token at each
-    step, the baseline model's own predicted (argmax) token at that same step,
-    each model's probability of the reference token, and the corresponding
-    per-step negative log-likelihood (NLL) — so callers can build a full
-    row-level table instead of only frame-bucketed summaries.
+    Reason: In free (autoregressive) generation, a single divergent token shifts
+    the entire continuation, making it impossible to attribute later differences
+    to quantization error versus the natural consequence of conditioning on a
+    different prefix. Teacher-forcing isolates the per-position effect of
+    quantization: each reported divergence reflects a position where quantization
+    alone caused the model to prefer a different token, independent of any
+    earlier divergence.
+
+    Reference: "Statistically-Lossless Quantization of Large Language Models"
+               arXiv:2405.02404, Section 3.2
+
+    Each per-sample result carries step-level detail (aligned with
+    result["per_step"]): the baseline model's own token at each step (from its
+    free-run generation), the quantized model's predicted (argmax) token at that
+    same step (from teacher forcing), each model's probability of the reference
+    token, and the corresponding per-step negative log-likelihood (NLL) — so
+    callers can build a full row-level table instead of only frame-bucketed
+    summaries.
     """
-    _required = ("model", "AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
+    _required = ("model", "AUDIO_TOKEN_START", "VOCAB_AUDIO_TOKEN_START", "END_OF_SPEECH", "TOKENS_PER_FRAME", "CODEBOOK_SIZE")
     if not all(hasattr(baseline_model, a) for a in _required):
+        return []
+    if not all(hasattr(quant_model, a) for a in _required):
         return []
 
     # VOCAB_AUDIO_TOKEN_START is the real tokenizer-vocab offset of the audio/codec
-    # token block; AUDIO_TOKEN_START may instead be relative to an already
-    # de-offset token representation (e.g. NeuTTS's regex-extracted audio_tokens).
-    audio_start = getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None)
-    if audio_start is None:
-        audio_start = baseline_model.AUDIO_TOKEN_START
+    # token block. All models must define this explicitly (no fallback).
+    audio_start = baseline_model.VOCAB_AUDIO_TOKEN_START
     audio_end = audio_start + baseline_model.TOKENS_PER_FRAME * baseline_model.CODEBOOK_SIZE
     per_sample = []
 
-    for entry in quant_manifest:
-        gids_path = entry.get("generated_ids_path")
-        probs_path = entry.get("audio_probs_path")
-        if not gids_path or not probs_path:
+    for baseline_entry, quant_entry in zip(baseline_manifest, quant_manifest):
+        # Load BASELINE's reference sequence (the frozen ground truth)
+        baseline_gids_path = baseline_entry.get("generated_ids_path")
+        baseline_probs_path = baseline_entry.get("audio_probs_path")
+        if not baseline_gids_path or not baseline_probs_path:
             continue
-        if not Path(gids_path).exists() or not Path(probs_path).exists():
+        if not Path(baseline_gids_path).exists() or not Path(baseline_probs_path).exists():
             continue
 
-        reference_ids = torch.load(gids_path, map_location=baseline_model.device, weights_only=True)
-        quant_probs = torch.from_numpy(np.load(probs_path)).float()
+        # BASELINE's own generated sequence (the reference)
+        reference_ids = torch.load(baseline_gids_path, map_location=quant_model.device, weights_only=True)
 
-        baseline_probs, token_ids = extract_teacher_forced_logits(
-            model=baseline_model.model,
+        # BASELINE's own probabilities (from its free-run generation)
+        baseline_probs = torch.from_numpy(np.load(baseline_probs_path)).float()
+
+        # QUANT model teacher-forced on BASELINE's sequence
+        quant_probs, token_ids = extract_teacher_forced_logits(
+            model=quant_model.model,
             reference_ids=reference_ids,
-            eos_token_id=baseline_model.END_OF_SPEECH,
-            prompt_length=entry["input_length"],
+            eos_token_id=quant_model.END_OF_SPEECH,
+            prompt_length=baseline_entry["input_length"],
             token_filter=lambda t: audio_start <= t < audio_end,
             vocab_slice=(audio_start, audio_end),
-            tokens_per_frame=baseline_model.TOKENS_PER_FRAME,
+            tokens_per_frame=quant_model.TOKENS_PER_FRAME,
         )
 
         result = compare_distributions(
@@ -416,12 +435,13 @@ def teacher_forced_distribution_compare(
         )
 
         # step_* arrays line up 1:1 with result["per_step"]'s kl/js/argmax_mismatch lists.
+        # token_ids are the baseline's reference tokens (from its free-run generation)
         n = min(len(baseline_probs), len(quant_probs), len(token_ids))
         offsets = (token_ids[:n] - audio_start).long()
         idx = torch.arange(n)
-        baseline_argmax = baseline_probs[:n].argmax(dim=-1)
-        result["step_baseline_token_id"] = (baseline_argmax + audio_start).tolist()
-        result["step_quant_token_id"] = token_ids[:n].tolist()
+        quant_argmax = quant_probs[:n].argmax(dim=-1)
+        result["step_baseline_token_id"] = token_ids[:n].tolist()  # baseline's actual token
+        result["step_quant_token_id"] = (quant_argmax + audio_start).tolist()  # quant's predicted token
         step_baseline_prob = baseline_probs[:n][idx, offsets]
         step_quant_prob = quant_probs[:n][idx, offsets]
         result["step_baseline_prob"] = step_baseline_prob.tolist()
@@ -434,8 +454,8 @@ def teacher_forced_distribution_compare(
             result["summary"]["perplexity_baseline"] = math.exp(result["summary"]["mean_nll_baseline"])
             result["summary"]["perplexity_quant"] = math.exp(result["summary"]["mean_nll_quant"])
 
-        result["sample_id"] = entry["sample_id"]
-        result["text"] = entry["text"]
+        result["sample_id"] = baseline_entry["sample_id"]
+        result["text"] = baseline_entry["text"]
         per_sample.append(result)
 
     return per_sample
@@ -487,11 +507,15 @@ def _run_single_quant_comparison(
     quant_manifest = run_model(quant_model, prompts, args, output_dir / quant_type)
     quant_model.unload()
 
-    # Teacher-force the quant model's own free-run output through the reloaded
-    # full-precision baseline model (one model resident at a time) to measure
-    # how well the reference model endorses what quantization actually produced.
+    # Teacher-force the quantized model on the baseline's reference sequence
+    # (one model resident at a time) to measure pure quantization error without
+    # autoregressive drift contamination.
     baseline_model.load()
-    dist_per_sample = teacher_forced_distribution_compare(quant_manifest, baseline_model)
+    quant_model.load()
+    dist_per_sample = teacher_forced_distribution_compare(
+        baseline_manifest, quant_manifest, baseline_model, quant_model
+    )
+    quant_model.unload()
     baseline_model.unload()
 
     per_sample_scores = compare_runs(baseline_manifest, quant_manifest)

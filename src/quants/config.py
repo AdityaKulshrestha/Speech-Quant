@@ -7,11 +7,8 @@ what --quant-type takes (comma-separated for multiple), what quant_models/
 cache directories embed, and what ends up in the analysis_report.xlsx
 (model, quant_type) columns. Keep it identical everywhere.
 
-Every flavour here is applied via the llm-compressor backend
-(llmcompressor.oneshot(), see quants/quantizer.py). The original
-gptqmodel-based backend is kept as an internal alternate entrypoint
-(quantize_model(..., backend="gptq")) and is not wired to any of these
-aliases right now.
+All quantization methods use llm_compressor (llmcompressor.oneshot(), see
+quants/quantizer.py).
 
 rtn/gptq/awq are weight-only (activations stay fp16/bf16: W4A16/W8A16).
 sq (SmoothQuant) additionally quantizes activations to int8 (W4A8/W8A8),

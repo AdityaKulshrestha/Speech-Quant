@@ -48,6 +48,9 @@ class OrpheusTTS(BaseTTS):
     PAD_TOKEN = 128263
 
     AUDIO_TOKEN_START = 128266
+    VOCAB_AUDIO_TOKEN_START = 128266
+    # Orpheus audio tokens occupy LLM vocab positions 128266+ directly
+    # (unlike NeuTTS/OuteTTS which store de-offset 0+ tokens).
 
     # SNAC
     CODEBOOK_SIZE = 4096
@@ -84,20 +87,10 @@ class OrpheusTTS(BaseTTS):
 
         print(f"Loading Orpheus model: {self.model_name}")
 
-        if self.quant_type.startswith("gptq"):
-            from quants.quantizer import quantize_model
-
-            print(f"GPTQ loading/quantizing ({self.quant_type}): {self.model_name}")
-            self.model = quantize_model(
-                self.model_name,
-                self.quant_type,
-                device=self.device,
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=self.dtype,
-            ).to(self.device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=self.dtype,
+        ).to(self.device)
 
         self.model.eval()
 

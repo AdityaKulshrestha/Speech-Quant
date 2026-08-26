@@ -1,16 +1,12 @@
 """
 Quantizes or loads a cached quantized model for TTS model backbones.
 
-Two backends:
-  - "llm_compressor" (default — every --quant-type alias in quants/config.py
-    uses this today): applies RTN / GPTQ / AWQ / SmoothQuant via
-    llmcompressor.oneshot(), saving/loading compressed-tensors checkpoints.
-  - "gptq": the original gptqmodel-based implementation, kept as an internal
-    alternate entrypoint (quantize_model(..., backend="gptq")) — not wired
-    to any --quant-type value right now.
+Uses llm_compressor for all quantization methods (RTN, GPTQ, AWQ, SmoothQuant),
+applying them via llmcompressor.oneshot() and saving/loading compressed-tensors
+checkpoints.
 
-Resolution order (both backends):
-  1. Cache hit: <QUANT_STORE>/<model_slug>__<backend>__<quant_type>/ exists
+Resolution order:
+  1. Cache hit: <QUANT_STORE>/<model_slug>__<quant_type>/ exists
      → load from cache.
   2. model_id is already a pre-quantized local dir → load directly.
   3. Float model → quantize, save to cache, return.
@@ -25,40 +21,71 @@ import torch
 
 from .config import QUANT_CONFIGS
 
-# One sub-directory per (model_id, backend, quant_type) triple lives here.
+# One sub-directory per (model_id, quant_type) pair lives here.
 _QUANT_STORE = Path(__file__).resolve().parents[2] / "quant_models"
 
-# gptqmodel-backend configs, keyed by the same quant_type aliases as
-# quants/config.py so both backends share one nomenclature.
-_GPTQMODEL_CONFIGS = {
-    "gptq-4bit": {"bits": 4, "group_size": 128},
-    "gptq-8bit": {"bits": 8, "group_size": 128},
-}
 
-
-def _model_slug(model_id: str, quant_type: str, backend: str) -> str:
-    """Build a safe directory name from model_id + backend + quant_type."""
+def _model_slug(model_id: str, quant_type: str) -> str:
+    """Build a safe directory name from model_id + quant_type."""
     slug = re.sub(r"[/\\:]+", "--", model_id.strip("/\\"))
     slug = re.sub(r"[\s.]+", "-", slug).strip("-")
-    return f"{slug}__{backend}__{quant_type}"
+    return f"{slug}__{quant_type}"
 
 
-def _cache_path(model_id: str, quant_type: str, backend: str, store: Path = _QUANT_STORE) -> Path:
-    return store / _model_slug(model_id, quant_type, backend)
+def _cache_path(model_id: str, quant_type: str, store: Path = _QUANT_STORE) -> Path:
+    return store / _model_slug(model_id, quant_type)
+
+
+def compute_model_size_mb(model: torch.nn.Module) -> float:
+    """Compute model size in MB (all parameters, accounting for quantization)."""
+    total_bytes = 0
+
+    for param in model.parameters():
+        # Check for quantized parameters (compressed-tensors format)
+        if hasattr(param, 'qweight'):
+            # Packed quantized weights
+            total_bytes += param.qweight.element_size() * param.qweight.numel()
+            # Add scales if present
+            if hasattr(param, 'weight_scale'):
+                total_bytes += param.weight_scale.element_size() * param.weight_scale.numel()
+            # Add zero-points if present
+            if hasattr(param, 'weight_zero_point'):
+                total_bytes += param.weight_zero_point.element_size() * param.weight_zero_point.numel()
+        else:
+            # Regular FP16/BF16/FP32 parameter
+            total_bytes += param.element_size() * param.numel()
+
+    return total_bytes / (1024 ** 2)
 
 
 def _fetch_calibration_data(n_samples: int = 512) -> List[str]:
-    """Download a small slice of C4 for calibration (mirrors test.py)."""
+    """Fetch TTS-domain calibration data with comprehensive phonetic coverage.
+
+    Uses Harvard Sentences (nineninesix/harvard-sentences-tts-benchmark),
+    which covers all English phonemes systematically. This ensures quantization
+    calibration matches the TTS inference domain.
+
+    Args:
+        n_samples: Number of calibration samples needed (default: 512)
+
+    Returns:
+        List of text strings for calibration (exactly n_samples)
+    """
     from datasets import load_dataset
 
-    return (
-        load_dataset(
-            "allenai/c4",
-            data_files="en/c4-train.00001-of-01024.json.gz",
-            split="train",
-        )
-        .select(range(n_samples))["text"]
-    )
+    # Load Harvard sentences: 720 phonetically-balanced sentences for TTS
+    ds = load_dataset("nineninesix/harvard-sentences-tts-benchmark", split="train")
+    texts = ds["text"]
+
+    # Repeat sentences if n_samples > dataset size
+    if len(texts) < n_samples:
+        repetitions = (n_samples // len(texts)) + 1
+        texts = (texts * repetitions)[:n_samples]
+    else:
+        texts = texts[:n_samples]
+
+    print(f"Calibration: {len(texts)} Harvard sentences (phonetically balanced, TTS-domain)")
+    return texts
 
 
 def quantize_model(
@@ -68,16 +95,13 @@ def quantize_model(
     batch_size: int = 1,
     device: Optional[str] = None,
     store_dir: Optional[Path] = None,
-    backend: str = "llm_compressor",
     num_calibration_samples: int = 512,
     max_seq_length: int = 2048,
 ) -> torch.nn.Module:
     """
     Return an HF torch.nn.Module ready for inference on *device*.
 
-    backend: "llm_compressor" (default) or "gptq". Every model adapter in
-    src/models/ calls this without passing backend=, so they all use
-    llm-compressor unless a caller explicitly opts into the gptqmodel path.
+    Uses llm_compressor for all quantization methods (RTN, GPTQ, AWQ, SmoothQuant).
     """
 
     if quant_type not in QUANT_CONFIGS:
@@ -96,15 +120,10 @@ def quantize_model(
             "Add one in quants/config.py."
         )
 
-    if backend == "llm_compressor":
-        return _quantize_llm_compressor(
-            model_id, quant_type, spec, calibration,
-            num_calibration_samples, max_seq_length, device, store_dir,
-        )
-    if backend == "gptq":
-        return _quantize_gptqmodel(model_id, quant_type, calibration, batch_size, device, store_dir)
-
-    raise ValueError(f"Unknown backend={backend!r}. Available: 'llm_compressor', 'gptq'.")
+    return _quantize_llm_compressor(
+        model_id, quant_type, spec, calibration,
+        num_calibration_samples, max_seq_length, device, store_dir,
+    )
 
 
 # ---------------------------------------------------------------- llm_compressor
@@ -151,18 +170,24 @@ def _build_recipe(spec):
 
     if algorithm == "rtn":
         return QuantizationModifier(targets="Linear", scheme=scheme, ignore=ignore)
+
     if algorithm == "gptq":
         return GPTQModifier(targets="Linear", scheme=scheme, ignore=ignore)
+
     if algorithm == "awq":
-        # AWQModifier smooths using its built-in Llama mapping (every model
-        # this repo quantizes is a plain Llama-family backbone); the actual
-        # weight quantization is done by the QuantizationModifier that follows.
-        return [AWQModifier(), QuantizationModifier(targets=["Linear"], scheme=scheme, ignore=ignore)]
+        # AWQ: auto-detects architecture, smooths activations, then quantizes weights
+        return [
+            AWQModifier(),
+            QuantizationModifier(targets=["Linear"], scheme=scheme, ignore=ignore)
+        ]
+
     if algorithm == "sq":
+        # SmoothQuant: smooth activations (strength=0.8), then quantize weights+activations
         return [
             SmoothQuantModifier(smoothing_strength=0.8),
             GPTQModifier(targets="Linear", scheme=scheme, ignore=ignore),
         ]
+
     raise ValueError(f"Unknown algorithm={algorithm!r} in quant spec.")
 
 
@@ -181,7 +206,7 @@ def _quantize_llm_compressor(
     from llmcompressor import oneshot
 
     store = Path(store_dir) if store_dir else _QUANT_STORE
-    cache = _cache_path(model_id, quant_type, "llmcompressor", store)
+    cache = _cache_path(model_id, quant_type, store)
     load_device_map = {"": device} if device else {"": "cpu"}
 
     if _is_llm_compressor_quantized(cache):
@@ -195,6 +220,9 @@ def _quantize_llm_compressor(
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 
+    # Measure size before quantization
+    fp_size_mb = compute_model_size_mb(model)
+
     if calibration is None:
         calibration = _fetch_calibration_data(num_calibration_samples)
     dataset = _build_calibration_dataset(calibration, tokenizer, max_seq_length)
@@ -207,58 +235,24 @@ def _quantize_llm_compressor(
         num_calibration_samples=len(dataset),
     )
 
+    # Measure size after quantization
+    quant_size_mb = compute_model_size_mb(model)
+    compression_ratio = fp_size_mb / quant_size_mb if quant_size_mb > 0 else 1.0
+
     cache.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(cache), save_compressed=True)
     tokenizer.save_pretrained(str(cache))
+
+    # Save size metadata
+    (cache / "quant_stats.json").write_text(json.dumps({
+        "fp_size_mb": round(fp_size_mb, 2),
+        "quant_size_mb": round(quant_size_mb, 2),
+        "compression_ratio": round(compression_ratio, 2),
+        "quant_type": quant_type,
+    }, indent=2))
+
     print(f"Saved quantized model: {cache}")
+    print(f"Model size: {fp_size_mb:.1f} MB → {quant_size_mb:.1f} MB (compression: {compression_ratio:.2f}×)")
 
     return AutoModelForCausalLM.from_pretrained(str(cache), device_map=load_device_map)
-
-
-# ---------------------------------------------------------------- gptq (alternate)
-
-def _quantize_gptqmodel(
-    model_id: str,
-    quant_type: str,
-    calibration,
-    batch_size: int,
-    device: Optional[str],
-    store_dir: Optional[Path],
-) -> torch.nn.Module:
-    """Original gptqmodel-based backend. Internal alternate, not wired to the CLI."""
-    from gptqmodel import GPTQConfig, GPTQModel
-    from gptqmodel.utils.backend import BACKEND
-
-    if quant_type not in _GPTQMODEL_CONFIGS:
-        raise NotImplementedError(
-            f"backend='gptq' only supports {sorted(_GPTQMODEL_CONFIGS)}, got {quant_type!r}."
-        )
-
-    store = Path(store_dir) if store_dir else _QUANT_STORE
-    cache = _cache_path(model_id, quant_type, "gptqmodel", store)
-    load_device_map = {"": device} if device else {"": "cpu"}
-
-    def _is_pre_quantized(path: Union[str, Path]) -> bool:
-        return (Path(path) / "quantize_config.json").exists()
-
-    if _is_pre_quantized(cache):
-        print(f"Loading cached GPTQ model: {cache}")
-        return GPTQModel.load(str(cache), backend=BACKEND.GPTQ_TORCH, device_map=load_device_map).model
-    if _is_pre_quantized(model_id):
-        print(f"Loading pre-quantized model: {model_id}")
-        return GPTQModel.load(model_id, backend=BACKEND.GPTQ_TORCH, device_map=load_device_map).model
-
-    if calibration is None:
-        calibration = _fetch_calibration_data()
-
-    print(f"Quantizing {model_id!r} with gptqmodel ({quant_type}) → {cache}")
-    quant_cfg = GPTQConfig(**_GPTQMODEL_CONFIGS[quant_type])
-    gptq_model = GPTQModel.load(model_id, quantize_config=quant_cfg)
-    gptq_model.quantize(calibration, batch_size=batch_size)
-
-    cache.mkdir(parents=True, exist_ok=True)
-    gptq_model.save(str(cache))
-    print(f"Saved quantized model: {cache}")
-
-    return GPTQModel.load(str(cache), backend=BACKEND.GPTQ_TORCH, device_map=load_device_map).model
 

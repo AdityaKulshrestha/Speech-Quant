@@ -116,8 +116,47 @@ def pitch_pearson_correlation(
     return float(corr) if np.isfinite(corr) else None
 
 
+def utmos_score(audio_path: str | Path) -> float | None:
+    """Perceptual quality score via UTMOS (1=bad, 5=excellent).
+
+    Non-intrusive metric that predicts human Mean Opinion Score.
+    Returns None if UTMOS library not available.
+
+    Args:
+        audio_path: Path to audio file
+
+    Returns:
+        UTMOS score in [1, 5] range, or None if unavailable
+    """
+    try:
+        import torchaudio
+        from speechmos import MosPredictor
+
+        # Load UTMOS model (downloads checkpoint on first use)
+        predictor = MosPredictor.from_pretrained("utmos22_strong")
+
+        # Load audio at 16kHz (UTMOS requirement)
+        audio, sr = torchaudio.load(str(audio_path))
+        if sr != 16000:
+            audio = torchaudio.functional.resample(audio, sr, 16000)
+
+        # Convert to mono if stereo
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+
+        score = predictor(audio, 16000)
+        return float(score)
+
+    except ImportError:
+        # speechmos not installed - skip UTMOS
+        return None
+    except Exception as e:
+        print(f"UTMOS scoring failed: {e}")
+        return None
+
+
 def compare_acoustics(reference_path: str | Path, hypothesis_path: str | Path) -> dict[str, Any]:
-    """MCD + F0 Frame Error + Pitch Pearson Correlation for one baseline/quantized audio pair."""
+    """MCD + F0 + UTMOS for one baseline/quantized audio pair."""
     reference, sr = _load_audio(reference_path)
     hypothesis, _ = _load_audio(hypothesis_path, target_sr=sr)
 
@@ -125,6 +164,8 @@ def compare_acoustics(reference_path: str | Path, hypothesis_path: str | Path) -
         "mcd": mel_cepstral_distortion(reference, hypothesis, sr),
         "f0_frame_error": f0_frame_error(reference, hypothesis, sr),
         "pitch_pearson_correlation": pitch_pearson_correlation(reference, hypothesis, sr),
+        "utmos_baseline": utmos_score(reference_path),
+        "utmos_quant": utmos_score(hypothesis_path),
     }
 
 
@@ -143,16 +184,22 @@ def compare_acoustics_manifest(
 
 
 def summarize_acoustics(per_sample: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate MCD/F0 metrics across samples for the final score block."""
+    """Aggregate MCD/F0/UTMOS metrics across samples for the final score block."""
     mcds = [s["mcd"] for s in per_sample if s.get("mcd") is not None]
     fers = [s["f0_frame_error"] for s in per_sample if s.get("f0_frame_error") is not None]
     corrs = [s["pitch_pearson_correlation"] for s in per_sample if s.get("pitch_pearson_correlation") is not None]
+    utmos_base = [s["utmos_baseline"] for s in per_sample if s.get("utmos_baseline") is not None]
+    utmos_quant = [s["utmos_quant"] for s in per_sample if s.get("utmos_quant") is not None]
 
     return {
         "num_samples": len(per_sample),
         "mean_mcd": sum(mcds) / len(mcds) if mcds else None,
         "mean_f0_frame_error": sum(fers) / len(fers) if fers else None,
         "mean_pitch_pearson_correlation": sum(corrs) / len(corrs) if corrs else None,
+        "mean_utmos_baseline": sum(utmos_base) / len(utmos_base) if utmos_base else None,
+        "mean_utmos_quant": sum(utmos_quant) / len(utmos_quant) if utmos_quant else None,
+        "utmos_degradation": (sum(utmos_base) / len(utmos_base) - sum(utmos_quant) / len(utmos_quant))
+                             if utmos_base and utmos_quant else None,
         "num_samples_with_pitch_correlation": len(corrs),
     }
 
@@ -165,4 +212,5 @@ __all__ = [
     "mel_cepstral_distortion",
     "pitch_pearson_correlation",
     "summarize_acoustics",
+    "utmos_score",
 ]

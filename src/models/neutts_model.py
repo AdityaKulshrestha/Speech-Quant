@@ -78,17 +78,9 @@ class NeuTTSModel(BaseTTS):
         print(f"Loading NeuTTS backbone: {self.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-        if self.quant_type.startswith("gptq"):
-            from quants.quantizer import quantize_model
-
-            print(f"GPTQ loading ({self.quant_type}): {self.model_name}")
-            self.model = quantize_model(
-                self.model_name, self.quant_type, device=self.device
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, torch_dtype=self.dtype
-            ).to(self.device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name, torch_dtype=self.dtype
+        ).to(self.device)
 
         self.model.eval()
 
