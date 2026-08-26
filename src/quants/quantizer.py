@@ -36,29 +36,25 @@ def _cache_path(model_id: str, quant_type: str, store: Path = _QUANT_STORE) -> P
     return store / _model_slug(model_id, quant_type)
 
 
+def compute_dir_size_mb(path: Path) -> float:
+    """Compute size in MB of weight files in directory."""
+    weight_files = list(path.glob("*.safetensors")) or list(path.glob("*.bin"))
+    if not weight_files:
+        weight_files = [p for p in path.glob("*") if p.is_file() and p.name != "quant_stats.json"]
+    return sum(f.stat().st_size for f in weight_files) / (1024 ** 2)
+
+
 def compute_model_size_mb(model: torch.nn.Module) -> float:
-    """Compute model size in MB (all parameters, accounting for quantization)."""
+    """Compute uncompressed model size in MB (all parameters and buffers)."""
     total_bytes = 0
-
     for param in model.parameters():
-        # Check for quantized parameters (compressed-tensors format)
-        if hasattr(param, 'qweight'):
-            # Packed quantized weights
-            total_bytes += param.qweight.element_size() * param.qweight.numel()
-            # Add scales if present
-            if hasattr(param, 'weight_scale'):
-                total_bytes += param.weight_scale.element_size() * param.weight_scale.numel()
-            # Add zero-points if present
-            if hasattr(param, 'weight_zero_point'):
-                total_bytes += param.weight_zero_point.element_size() * param.weight_zero_point.numel()
-        else:
-            # Regular FP16/BF16/FP32 parameter
-            total_bytes += param.element_size() * param.numel()
-
+        total_bytes += param.element_size() * param.numel()
+    for buf in model.buffers():
+        total_bytes += buf.element_size() * buf.numel()
     return total_bytes / (1024 ** 2)
 
 
-def _fetch_calibration_data(n_samples: int = 512) -> List[str]:
+def _fetch_calibration_data(n_samples: Optional[int] = None) -> List[str]:
     """Fetch TTS-domain calibration data with comprehensive phonetic coverage.
 
     Uses Harvard Sentences (nineninesix/harvard-sentences-tts-benchmark),
@@ -66,23 +62,23 @@ def _fetch_calibration_data(n_samples: int = 512) -> List[str]:
     calibration matches the TTS inference domain.
 
     Args:
-        n_samples: Number of calibration samples needed (default: 512)
+        n_samples: Number of calibration samples needed. If None, uses all dataset samples.
 
     Returns:
-        List of text strings for calibration (exactly n_samples)
+        List of text strings for calibration
     """
     from datasets import load_dataset
 
     # Load Harvard sentences: 720 phonetically-balanced sentences for TTS
     ds = load_dataset("nineninesix/harvard-sentences-tts-benchmark", split="train")
-    texts = ds["text"]
+    texts = list(ds["text"])
 
-    # Repeat sentences if n_samples > dataset size
-    if len(texts) < n_samples:
-        repetitions = (n_samples // len(texts)) + 1
-        texts = (texts * repetitions)[:n_samples]
-    else:
-        texts = texts[:n_samples]
+    if n_samples is not None:
+        if len(texts) < n_samples:
+            repetitions = (n_samples // len(texts)) + 1
+            texts = (texts * repetitions)[:n_samples]
+        else:
+            texts = texts[:n_samples]
 
     print(f"Calibration: {len(texts)} Harvard sentences (phonetically balanced, TTS-domain)")
     return texts
@@ -95,7 +91,7 @@ def quantize_model(
     batch_size: int = 1,
     device: Optional[str] = None,
     store_dir: Optional[Path] = None,
-    num_calibration_samples: int = 512,
+    num_calibration_samples: Optional[int] = None,
     max_seq_length: int = 2048,
 ) -> torch.nn.Module:
     """
@@ -196,7 +192,7 @@ def _quantize_llm_compressor(
     quant_type: str,
     spec,
     calibration,
-    num_calibration_samples: int,
+    num_calibration_samples: Optional[int],
     max_seq_length: int,
     device: Optional[str],
     store_dir: Optional[Path],
@@ -235,13 +231,13 @@ def _quantize_llm_compressor(
         num_calibration_samples=len(dataset),
     )
 
-    # Measure size after quantization
-    quant_size_mb = compute_model_size_mb(model)
-    compression_ratio = fp_size_mb / quant_size_mb if quant_size_mb > 0 else 1.0
-
     cache.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(cache), save_compressed=True)
     tokenizer.save_pretrained(str(cache))
+
+    # Measure actual compressed size on disk (after save_compressed=True packs 4-bit/8-bit weights)
+    quant_size_mb = compute_dir_size_mb(cache)
+    compression_ratio = fp_size_mb / quant_size_mb if quant_size_mb > 0 else 1.0
 
     # Save size metadata
     (cache / "quant_stats.json").write_text(json.dumps({

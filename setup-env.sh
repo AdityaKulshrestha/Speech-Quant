@@ -57,6 +57,12 @@ setup_model() {
         fi
     fi
 
+    # Create virtual environment with python 3.12 if it doesn't exist
+    if [ ! -d "${venv_name}" ]; then
+        echo "Creating Python 3.12 environment ${venv_name}..."
+        uv venv "${venv_name}" --python 3.12
+    fi
+
     # Sync dependencies using UV_PROJECT_ENVIRONMENT
     echo "Syncing dependencies..."
     UV_PROJECT_ENVIRONMENT="${venv_name}" uv sync --group "${group}" --index-strategy unsafe-best-match

@@ -78,10 +78,10 @@ class QwenTTSModel(BaseTTS):
             dtype=self.dtype,
         )
 
-        if self.quant_type.startswith("gptq"):
+        if self.quant_type != "none":
             raise NotImplementedError(
-                "GPTQ quantization for QwenTTSModel is not yet supported. "
-                "The inner LM must be quantized before wrapping with Qwen3TTSModel."
+                f"Quantization ({self.quant_type}) for QwenTTSModel is not yet supported. "
+                "The inner talker LM must be quantized before wrapping with Qwen3TTSModel."
             )
 
         # Validate custom_voice model type

@@ -17,7 +17,7 @@ uv run --locked --no-sync python "$REPO_ROOT/src/evaluate.py" \
     --model-name canopylabs/orpheus-3b-0.1-ft \
     --quant-type "$QUANT_TYPES" \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
-    --num-samples 50 \
+    --num-samples 5 \
     --output-dir "$REPO_ROOT/outputs" \
     --voice tara \
     --device xpu \

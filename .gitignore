@@ -16,3 +16,4 @@ logs
 .config
 .opencode-trace
 CLAUDE.md
+.venv*

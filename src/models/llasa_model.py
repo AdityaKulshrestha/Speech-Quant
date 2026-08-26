@@ -107,10 +107,10 @@ class LlasaModel(BaseTTS):
         print(f"Loading Llasa backbone: {self.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-        if self.quant_type.startswith("gptq"):
+        if self.quant_type != "none":
             from quants.quantizer import quantize_model
 
-            print(f"GPTQ loading ({self.quant_type}): {self.model_name}")
+            print(f"Quantizing Llasa ({self.quant_type}): {self.model_name}")
             self.model = quantize_model(
                 self.model_name, self.quant_type, device=self.device
             )
