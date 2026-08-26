@@ -41,7 +41,7 @@ class QwenTTSModel(BaseTTS):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS",
+        model_name: str = "Qwen/Qwen3-TTS-1.7B-CustomVoice",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         quant_type: str = "none",

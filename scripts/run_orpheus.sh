@@ -6,7 +6,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-python "$REPO_ROOT/src/evaluate.py" \
+cd "$REPO_ROOT"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
+
+uv run --locked --no-sync python "$REPO_ROOT/src/evaluate.py" \
     --model orpheus \
     --model-name canopylabs/orpheus-3b-0.1-ft \
     --quant-type gptq-4bit \

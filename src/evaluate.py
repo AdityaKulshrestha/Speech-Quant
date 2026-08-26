@@ -14,25 +14,24 @@ workbook at <output-dir>/evaluation/analysis_report.xlsx.
 """
 
 import argparse
+import contextlib
 import json
 import math
 import random
 import time
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
+import triton.language  # noqa: F401 - torch._dynamo expects triton.language to be attached.
 from transformers import set_seed
 
 from decoding.alignment import CodebookDivergenceAnalyzer, detect_codec_family
 from decoding.distribution import compare_distributions, extract_teacher_forced_logits
 from evaluation.acoustic_metrics import compare_acoustics_manifest, summarize_acoustics
 from evaluation.report import update_report
-from evaluation.transcription import (
-    evaluate_transcription_run,
-    load_asr_model,
-)
 from evaluation.metrics import (
     codebook_ids_for_tokens,
     compare_sequences,
@@ -41,11 +40,6 @@ from evaluation.metrics import (
     probability_difference,
     summarize_scores,
 )
-from models.orpheus_model import OrpheusTTS
-from models.neutts_model import NeuTTSModel
-from models.qwentts_model import QwenTTSModel
-from models.outetts_model import OuteTTSModel
-from models.llasa_model import LlasaModel
 from quants.config import QUANT_CONFIGS
 from visualization.heatmap import (
     save_codebook_heatmap,
@@ -57,11 +51,11 @@ SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SRC_DIR.parent
 
 MODEL_REGISTRY = {
-    "orpheus": OrpheusTTS,
-    "neutts": NeuTTSModel,
-    "qwen": QwenTTSModel,
-    "outetts": OuteTTSModel,
-    "llasa": LlasaModel,
+    "orpheus": ("models.orpheus_model", "OrpheusTTS"),
+    "neutts": ("models.neutts_model", "NeuTTSModel"),
+    "qwen": ("models.qwentts_model", "QwenTTSModel"),
+    "outetts": ("models.outetts_model", "OuteTTSModel"),
+    "llasa": ("models.llasa_model", "LlasaModel"),
 }
 
 
@@ -85,11 +79,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--quant-type",
-        choices=sorted(QUANT_CONFIGS),
         default="none",
         help=(
-            "Quantization flavour to compare against the full-precision "
-            "baseline (see quants/config.py). 'none' runs only the baseline."
+            "Comma-separated quantization flavours to compare against the full-precision "
+            "baseline, e.g. 'gptq-4bit,rtn-8bit,awq-4bit,sq-8bit' (see quants/config.py "
+            "for the full list). The baseline is generated once and every listed flavour "
+            "is compared against that same baseline run. 'none' (default) runs only the "
+            "baseline; mixing 'none' into a list with other flavours just ignores it."
         ),
     )
     parser.add_argument(
@@ -156,8 +152,33 @@ def load_prompts(prompts_file: str, num_samples: int) -> list[str]:
     return prompts[:num_samples]
 
 
+def parse_quant_types(raw: str) -> list[str]:
+    """Split --quant-type's comma-separated value into a validated, ordered,
+    de-duplicated list of real quant flavours ('none' entries are dropped)."""
+    values = [v.strip() for v in raw.split(",") if v.strip()]
+    if not values:
+        raise ValueError("--quant-type must not be empty.")
+
+    unknown = [v for v in values if v not in QUANT_CONFIGS]
+    if unknown:
+        raise ValueError(
+            f"Unknown --quant-type value(s) {unknown}. Available: {sorted(QUANT_CONFIGS)}"
+        )
+
+    seen: set[str] = set()
+    quant_types = []
+    for v in values:
+        if v == "none" or v in seen:
+            continue
+        seen.add(v)
+        quant_types.append(v)
+
+    return quant_types
+
+
 def build_model(args: argparse.Namespace, quant_type: str):
-    model_cls = MODEL_REGISTRY[args.model]
+    module_name, class_name = MODEL_REGISTRY[args.model]
+    model_cls = getattr(import_module(module_name), class_name)
 
     kwargs = {"device": args.device, "quant_type": quant_type}
     if args.model_name:
@@ -173,6 +194,25 @@ def synchronize(device: str) -> None:
         torch.cuda.synchronize()
     elif device.startswith("xpu") and hasattr(torch, "xpu") and torch.xpu.is_available():
         torch.xpu.synchronize()
+
+
+@contextlib.contextmanager
+def deterministic_disabled():
+    """Temporarily lift torch's deterministic-algorithms enforcement.
+
+    Weight packing (e.g. `scatter_add_` in compressed-tensors' `pack_to_int32`)
+    has no deterministic kernel and raises under `use_deterministic_algorithms`.
+    Packing is exact bit manipulation, so relaxing it here does not affect
+    reproducibility of generation, which is what determinism is enabled for.
+    """
+
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=warn_only)
 
 
 def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path) -> list[dict]:
@@ -426,25 +466,25 @@ def _aggregate_distribution_summary(per_sample: list[dict]) -> dict:
     return agg
 
 
-def run_experiment(args: argparse.Namespace) -> None:
-    prompts = load_prompts(args.prompts_file, args.num_samples)
+def _run_single_quant_comparison(
+    args: argparse.Namespace,
+    quant_type: str,
+    baseline_model,
+    baseline_manifest: list[dict],
+    prompts: list[str],
+    output_dir: Path,
+    analysis_dir: Path,
+) -> None:
+    """Quantize with *quant_type*, generate, and compare against the already-
+    generated *baseline_manifest* — the same baseline run is reused for every
+    quant_type in the --quant-type list, never regenerated per flavour."""
 
-    baseline_model = build_model(args, quant_type="none")
-    model_slug = Path(baseline_model.model_name).name
-    output_dir = Path(args.output_dir) / "evaluation" / model_slug
-    analysis_dir = output_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-
-    baseline_model.load()
-    baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
-    baseline_model.unload()
-
-    if args.quant_type == "none":
-        return
-
-    quant_model = build_model(args, quant_type=args.quant_type)
-    quant_model.load()
-    quant_manifest = run_model(quant_model, prompts, args, output_dir / args.quant_type)
+    quant_model = build_model(args, quant_type=quant_type)
+    # Quantization/packing runs non-deterministic kernels; determinism is
+    # restored right after loading, before any generation happens.
+    with deterministic_disabled():
+        quant_model.load()
+    quant_manifest = run_model(quant_model, prompts, args, output_dir / quant_type)
     quant_model.unload()
 
     # Teacher-force the quant model's own free-run output through the reloaded
@@ -461,7 +501,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     acoustics_per_sample = compare_acoustics_manifest(baseline_manifest, quant_manifest)
     acoustics_summary = summarize_acoustics(acoustics_per_sample)
 
-    print(f"\n=== {args.quant_type} vs baseline ===")
+    print(f"\n=== {quant_type} vs baseline ===")
     print(json.dumps(summary, indent=2))
     if dist_summary:
         print("Distribution analysis (teacher-forced):")
@@ -471,38 +511,18 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     save_token_heatmap(
         baseline_manifest, quant_manifest,
-        analysis_dir / f"heatmap_{args.quant_type}.png",
+        analysis_dir / f"heatmap_{quant_type}.png",
     )
     save_codebook_heatmap(
         baseline_manifest, quant_manifest,
-        analysis_dir / f"codebook_{args.quant_type}.png",
+        analysis_dir / f"codebook_{quant_type}.png",
     )
     save_prob_diff_heatmap(
         per_sample_scores,
-        analysis_dir / f"prob_diff_{args.quant_type}.png",
+        analysis_dir / f"prob_diff_{quant_type}.png",
     )
 
-    asr_model_name = "CohereLabs/cohere-transcribe-03-2026"
-    asr_processor, asr_model = load_asr_model(asr_model_name, device_map="auto")
-
-    baseline_result = evaluate_transcription_run(
-        output_dir / "baseline",
-        prompts,
-        asr_model,
-        asr_processor,
-        batch_size=8,
-        sampling_rate=16000,
-        language="en",
-    )
-    quant_result = evaluate_transcription_run(
-        output_dir / args.quant_type,
-        prompts,
-        asr_model,
-        asr_processor,
-        batch_size=8,
-        sampling_rate=16000,
-        language="en",
-    )
+    empty_transcription = {"samples": []}
 
     divergence_analyzer = CodebookDivergenceAnalyzer(
         model_name=getattr(baseline_model, "model_name", None),
@@ -518,7 +538,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     update_report(
         report_path,
         model=getattr(baseline_model, "model_name", None),
-        quant_type=args.quant_type,
+        quant_type=quant_type,
         scores_summary=summary,
         per_sample_scores=per_sample_scores,
         dist_summary=dist_summary,
@@ -526,8 +546,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         acoustics_summary=acoustics_summary,
         acoustics_per_sample=acoustics_per_sample,
         codebook_divergence=divergence_summary,
-        baseline_transcription=baseline_result,
-        quant_transcription=quant_result,
+        baseline_transcription=empty_transcription,
+        quant_transcription=empty_transcription,
         audio_token_start=(
             getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None)
             if getattr(baseline_model, "VOCAB_AUDIO_TOKEN_START", None) is not None
@@ -536,8 +556,30 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     print(f"Consolidated report updated: {report_path}")
 
-    asr_model = None
-    asr_processor = None
+
+def run_experiment(args: argparse.Namespace) -> None:
+    quant_types = parse_quant_types(args.quant_type)
+    prompts = load_prompts(args.prompts_file, args.num_samples)
+
+    baseline_model = build_model(args, quant_type="none")
+    model_slug = Path(baseline_model.model_name).name
+    output_dir = Path(args.output_dir) / "evaluation" / model_slug
+    analysis_dir = output_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_model.load()
+    baseline_manifest = run_model(baseline_model, prompts, args, output_dir / "baseline")
+    baseline_model.unload()
+
+    if not quant_types:
+        return
+
+    print(f"Comparing quant flavours {quant_types} against the same baseline run.")
+    for quant_type in quant_types:
+        _run_single_quant_comparison(
+            args, quant_type, baseline_model, baseline_manifest,
+            prompts, output_dir, analysis_dir,
+        )
 
 
 def main() -> None:

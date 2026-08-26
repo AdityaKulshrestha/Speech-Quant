@@ -269,6 +269,35 @@ def _style_sheet(ws) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(best_len + 2, 10), 60)
 
 
+def _write_workbook(
+    report_path: Path,
+    summary_long: pd.DataFrame,
+    per_sample: pd.DataFrame,
+    logprobs_kl: pd.DataFrame,
+    codec: pd.DataFrame,
+) -> None:
+    summary_wide = (
+        summary_long.pivot_table(index="metric", columns=["model", "quant_type"], values="value", aggfunc="first")
+        if not summary_long.empty
+        else pd.DataFrame()
+    )
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
+        summary_wide.to_excel(writer, sheet_name=SUMMARY_SHEET)
+        per_sample.to_excel(writer, sheet_name=PER_SAMPLE_SHEET, index=False)
+        logprobs_kl.to_excel(writer, sheet_name=LOGPROBS_SHEET, index=False)
+        codec.to_excel(writer, sheet_name=CODEC_SHEET, index=False)
+        summary_long.to_excel(writer, sheet_name=SUMMARY_DATA_SHEET, index=False)
+
+        for name in (PER_SAMPLE_SHEET, LOGPROBS_SHEET, CODEC_SHEET):
+            _style_sheet(writer.sheets[name])
+        writer.sheets[SUMMARY_SHEET].freeze_panes = "B3"
+        for cell in writer.sheets[SUMMARY_SHEET][2]:
+            cell.font = Font(bold=True)
+        writer.sheets[SUMMARY_DATA_SHEET].sheet_state = "hidden"
+
+
 def update_report(
     report_path: Path,
     model: str,
@@ -316,26 +345,62 @@ def update_report(
         model, quant_type,
     )
 
-    summary_wide = (
-        summary_long.pivot_table(index="metric", columns=["model", "quant_type"], values="value", aggfunc="first")
-        if not summary_long.empty
-        else pd.DataFrame()
+    _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
+
+
+def update_transcription_report(
+    report_path: Path,
+    model: str,
+    quant_type: str,
+    baseline_transcription: dict[str, Any],
+    quant_transcription: dict[str, Any],
+) -> None:
+    """Upsert WER/CER transcription results into an existing report workbook."""
+    summary_long = _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"])
+    per_sample = _read_sheet(report_path, PER_SAMPLE_SHEET, [*_KEY_COLS, "sample_id"])
+    logprobs_kl = _read_sheet(report_path, LOGPROBS_SHEET, [*_KEY_COLS, "sample_id", "step"])
+    codec = _read_sheet(report_path, CODEC_SHEET, [*_KEY_COLS, "sample_id", "hierarchy_level"])
+
+    metric_values = {
+        "baseline_wer": baseline_transcription.get("mean_wer"),
+        "baseline_cer": baseline_transcription.get("mean_cer"),
+        "quant_wer": quant_transcription.get("mean_wer"),
+        "quant_cer": quant_transcription.get("mean_cer"),
+    }
+    new_summary = pd.DataFrame(
+        {
+            "metric": list(metric_values),
+            "model": model,
+            "quant_type": quant_type,
+            "value": list(metric_values.values()),
+        }
     )
+    if not summary_long.empty:
+        mask = (summary_long["model"] == model) & (summary_long["quant_type"] == quant_type) & (
+            summary_long["metric"].isin(metric_values)
+        )
+        summary_long = summary_long.loc[~mask]
+    summary_long = pd.concat([summary_long, new_summary], ignore_index=True)
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
-        summary_wide.to_excel(writer, sheet_name=SUMMARY_SHEET)
-        per_sample.to_excel(writer, sheet_name=PER_SAMPLE_SHEET, index=False)
-        logprobs_kl.to_excel(writer, sheet_name=LOGPROBS_SHEET, index=False)
-        codec.to_excel(writer, sheet_name=CODEC_SHEET, index=False)
-        summary_long.to_excel(writer, sheet_name=SUMMARY_DATA_SHEET, index=False)
+    if per_sample.empty:
+        raise ValueError(f"{report_path} has no {PER_SAMPLE_SHEET!r} rows to update.")
 
-        for name in (PER_SAMPLE_SHEET, LOGPROBS_SHEET, CODEC_SHEET):
-            _style_sheet(writer.sheets[name])
-        writer.sheets[SUMMARY_SHEET].freeze_panes = "B3"
-        for cell in writer.sheets[SUMMARY_SHEET][2]:
-            cell.font = Font(bold=True)
-        writer.sheets[SUMMARY_DATA_SHEET].sheet_state = "hidden"
+    mask = (per_sample["model"] == model) & (per_sample["quant_type"] == quant_type)
+    row_indices = list(per_sample.index[mask])
+    baseline_samples = baseline_transcription.get("samples", [])
+    quant_samples = quant_transcription.get("samples", [])
+
+    for offset, row_index in enumerate(row_indices):
+        baseline_t = baseline_samples[offset] if offset < len(baseline_samples) else {}
+        quant_t = quant_samples[offset] if offset < len(quant_samples) else {}
+        per_sample.loc[row_index, "baseline_transcript"] = baseline_t.get("transcript")
+        per_sample.loc[row_index, "baseline_wer"] = baseline_t.get("wer")
+        per_sample.loc[row_index, "baseline_cer"] = baseline_t.get("cer")
+        per_sample.loc[row_index, "quant_transcript"] = quant_t.get("transcript")
+        per_sample.loc[row_index, "quant_wer"] = quant_t.get("wer")
+        per_sample.loc[row_index, "quant_cer"] = quant_t.get("cer")
+
+    _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
 
 
-__all__ = ["update_report"]
+__all__ = ["update_report", "update_transcription_report"]
