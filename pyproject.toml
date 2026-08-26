@@ -11,6 +11,7 @@ dependencies = []
 # ============================================================
 base = [
     "torch==2.11.0+xpu",
+    "torchaudio==0.26.0+xpu", #2.13 works
     "torchaudio==2.11.0+xpu",
     "accelerate>=0.30",
     "soundfile>=0.12",
@@ -19,6 +20,8 @@ base = [
     # numpy version specified per-model due to llmcompressor/neucodec conflicts
     "matplotlib>=3.7",
     "pandas>=2.0",
+    "gptqmode>=7.0.0",
+    "optimum==2.2.0",
     "openpyxl>=3.1",  # consolidated analysis_report.xlsx
     "nemo_text_processing>=1.0",  # WER/CER text normalization
 ]
