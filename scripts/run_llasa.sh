@@ -23,3 +23,6 @@ QUANT_TYPES="rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-
     --temperature 0.8 \
     --top-p 1.0 \
     --seed 0
+
+# evaluate.py leaves WER/CER blank; fill them in from the audio just generated.
+"$SCRIPT_DIR/transcribe.sh" "$REPO_ROOT/outputs/evaluation/Llasa-1B"

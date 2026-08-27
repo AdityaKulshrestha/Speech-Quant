@@ -21,3 +21,6 @@ python "$REPO_ROOT/src/evaluate.py" \
     --max-new-tokens 1200 \
     --temperature 1.0 \
     --seed 0
+
+# evaluate.py leaves WER/CER blank; fill them in from the audio just generated.
+"$SCRIPT_DIR/transcribe.sh" "$REPO_ROOT/outputs/evaluation/neutts-2e"

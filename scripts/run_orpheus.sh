@@ -26,3 +26,6 @@ uv run --locked --no-sync python "$REPO_ROOT/src/evaluate.py" \
     --top-p 0.95 \
     --repetition-penalty 1.1 \
     --seed 0
+
+# evaluate.py leaves WER/CER blank; fill them in from the audio just generated.
+"$SCRIPT_DIR/transcribe.sh" "$REPO_ROOT/outputs/evaluation/orpheus-3b-0.1-ft"

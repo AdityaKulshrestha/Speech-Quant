@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         default="tara",
         help=(
             "Speaker/voice tag (Orpheus: voice style; NeuTTS: emily/paul/sophie/steven; "
-            "OuteTTS/Llasa: unused, zero-shot only)."
+            "OuteTTS/Llasa/Qwen: unused, zero-shot or model-default voice)."
         ),
     )
     parser.add_argument(

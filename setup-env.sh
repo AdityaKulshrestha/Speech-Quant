@@ -4,7 +4,7 @@
 
 set -e
 
-MODELS="orpheus neutts qwen outetts"
+MODELS="orpheus neutts qwen outetts asr"
 
 show_help() {
     cat << EOF
@@ -17,6 +17,7 @@ Available models:
   neutts    - NeuTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   qwen      - Qwen TTS (transformers 4.57.3, llmcompressor 0.9.x, torch 2.9.1)
   outetts   - OuteTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
+  asr       - Cohere ASR WER/CER pass only (group "asr", no TTS deps)
   all       - Create all model environments
 
 Flags:
@@ -32,11 +33,52 @@ Note: Requires --index-strategy unsafe-best-match for package resolution.
 EOF
 }
 
+setup_asr() {
+    local reinstall=$1
+    local venv_name=".venv-asr"
+
+    echo "======================================"
+    echo "Setting up: asr (Cohere ASR WER/CER pass)"
+    echo "Environment: ${venv_name}"
+    echo "Group: asr"
+    echo "======================================"
+
+    if [ "${reinstall}" = "--reinstall" ] && [ -d "${venv_name}" ]; then
+        echo "Removing existing environment..."
+        rm -rf "${venv_name}"
+    fi
+
+    if [ ! -d "${venv_name}" ]; then
+        echo "Creating Python 3.12 environment ${venv_name}..."
+        uv venv "${venv_name}" --python 3.12
+    fi
+
+    # `uv pip install --group` resolves only that group; `uv sync` would resolve
+    # every group in the project, so unrelated breakage in `base` would block this env.
+    echo "Installing dependencies..."
+    uv pip install --python "${venv_name}" \
+        --index-strategy unsafe-best-match \
+        --group asr
+
+    echo ""
+    echo "✓ Environment ready: ${venv_name}"
+    echo ""
+    echo "To run:"
+    echo "  PYTHONPATH=src ${venv_name}/bin/python src/evaluate_transcription.py \\"
+    echo "      --audio-root outputs/evaluation --quant-type all --batch-size 8"
+    echo ""
+}
+
 setup_model() {
     local model=$1
     local reinstall=$2
     local venv_name=".venv-${model}"
     local group="${model}"
+
+    if [ "${model}" = "asr" ]; then
+        setup_asr "${reinstall}"
+        return
+    fi
 
     # Map model names to group names
     case "${model}" in
@@ -109,7 +151,7 @@ case "${MODEL}" in
         done
         echo ""
         ;;
-    orpheus|neutts|qwen|outetts)
+    orpheus|neutts|qwen|outetts|asr)
         setup_model "${MODEL}" "${REINSTALL}"
         ;;
     qwen-tts)

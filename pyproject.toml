@@ -90,6 +90,26 @@ outetts = [
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
+# ASR: WER/CER pass over already-generated audio (src/evaluate_transcription.py).
+# Standalone on purpose -- it does not include `base`, so it needs no quantization
+# stack and stays resolvable independently. Install with `uv pip install --group asr`
+# (not `uv sync`, which would resolve every other group too).
+asr = [
+    "torch==2.11.0+xpu",
+    "torchaudio==2.11.0+xpu",
+    "accelerate>=0.30",
+    "transformers>=5.15.0",
+    "huggingface-hub>=1.5.0",
+    "sentencepiece>=0.2",  # CohereAsr tokenizer
+    "protobuf>=4.25",
+    "soundfile>=0.12",
+    "librosa>=0.10.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "nemo_text_processing>=1.0",
+]
+
 # LLASA: Temporarily disabled due to incompatible torch version (2.4.1 vs 2.11.0)
 # TODO: Re-enable after resolving torch version conflicts
 # llasa = [

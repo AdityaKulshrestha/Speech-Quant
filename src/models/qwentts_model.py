@@ -1,8 +1,9 @@
 """
 Qwen3 TTS model adapter for the Speech-Quant BaseTTS interface.
 
-Wraps Qwen3TTSModel (custom_voice type) using its internal generate step
-to capture codec codes as audio_tokens before decoding.
+Wraps Qwen3TTSModel using its internal generate step to capture codec codes as
+audio_tokens before decoding. The CustomVoice checkpoint uses its default
+speaker internally, without exposing a voice selection argument.
 
 qwen_tts==0.1.1 pins transformers==4.57.3 exactly and breaks under this repo's
 main transformers version (multiple incompatible API changes: check_model_inputs,
@@ -18,7 +19,7 @@ the dedicated `.venv-qwen` environment instead of the main `.venv`:
 """
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import transformers
@@ -30,7 +31,7 @@ _REQUIRED_TRANSFORMERS_PREFIX = "4.57."
 
 class QwenTTSModel(BaseTTS):
     """
-    Qwen3 TTS (custom_voice) + speech tokenizer wrapped for BaseTTS.
+    Qwen3 TTS + speech tokenizer wrapped for BaseTTS.
 
     audio_tokens = flattened codec codes (1D).  num_quantizers is stored
     in metadata so decode_audio can reshape before passing to the decoder.
@@ -38,10 +39,11 @@ class QwenTTSModel(BaseTTS):
 
     AUDIO_TOKEN_START = 0   # codes are 0-based (no vocabulary offset)
     SAMPLE_RATE = 24_000    # updated from model after load()
+    DEFAULT_SPEAKER = "Ethan"
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS-1.7B-CustomVoice",
+        model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         quant_type: str = "none",
@@ -77,19 +79,17 @@ class QwenTTSModel(BaseTTS):
             device_map={"": self.device},
             dtype=self.dtype,
         )
+        if self._qwen.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"{self.model_name!r} is not a custom_voice model "
+                f"(got {self._qwen.model.tts_model_type!r}). "
+                "QwenTTSModel only supports CustomVoice checkpoints."
+            )
 
         if self.quant_type != "none":
             raise NotImplementedError(
                 f"Quantization ({self.quant_type}) for QwenTTSModel is not yet supported. "
                 "The inner talker LM must be quantized before wrapping with Qwen3TTSModel."
-            )
-
-        # Validate custom_voice model type
-        if self._qwen.model.tts_model_type != "custom_voice":
-            raise ValueError(
-                f"{self.model_name!r} is not a custom_voice model "
-                f"(got {self._qwen.model.tts_model_type!r}). "
-                "QwenTTSModel only supports custom_voice models."
             )
 
         self.SAMPLE_RATE = self._qwen.model.speech_tokenizer.get_model_type(
@@ -103,14 +103,12 @@ class QwenTTSModel(BaseTTS):
         self.CODEBOOK_SIZE = talker_config.vocab_size
 
         print("Qwen3 TTS loaded.")
-        print("Supported speakers:", self._qwen.get_supported_speakers())
 
     # ---------------------------------------------------- BaseTTS interface
 
     def prepare_input(
         self,
         text: str,
-        voice: str = "Ethan",
         language: str = "English",
         **kwargs,
     ) -> dict[str, Any]:
@@ -119,7 +117,11 @@ class QwenTTSModel(BaseTTS):
         input_ids = self._qwen._tokenize_texts(
             [self._qwen._build_assistant_text(text)]
         )
-        return {"input_ids": input_ids, "speaker": voice, "language": language}
+        return {
+            "input_ids": input_ids,
+            "speaker": self.DEFAULT_SPEAKER,
+            "language": language,
+        }
 
     @torch.inference_mode()
     def generate_tokens(

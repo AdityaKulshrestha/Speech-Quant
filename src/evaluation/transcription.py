@@ -3,7 +3,7 @@
 
 This script:
   1. scans generated audio outputs for each quantized model under an output root,
-    2. transcribes those waveforms in batches using the Qwen3-ASR model,
+    2. transcribes those waveforms in batches using the Cohere ASR model,
   3. compares each transcript against the original prompt text,
   4. aggregates WER/CER per quant and writes the result to a JSON file.
 
@@ -18,16 +18,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import torch
 from transformers.audio_utils import load_audio
 
-DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
+DEFAULT_MODEL = "CohereLabs/cohere-transcribe-03-2026"
 DEFAULT_SAMPLE_RATE = 16000
 
 _normalizer = None  # lazy singleton: NeMo grammar construction takes ~30s
+_APOSTROPHE_RE = re.compile(r"['\u2018\u2019\u02bc]")
+_PUNCTUATION_RE = re.compile(r"[^\w\s]|_", flags=re.UNICODE)
 
 
 def _get_normalizer():
@@ -40,15 +43,24 @@ def _get_normalizer():
 
 
 def normalize_text(text: str) -> str:
-    """Expand text to spoken form (numbers, dates, currency, etc.) via NeMo, then
-    lowercase + collapse whitespace for robust WER/CER comparison."""
+    """Expand text to spoken form (numbers, dates, currency, etc.) via NeMo, then strip
+    punctuation, lowercase, and collapse whitespace for robust WER/CER comparison.
+
+    TTS output and ASR transcripts punctuate differently for identical speech, so
+    punctuation is dropped before scoring rather than counted as errors.
+    """
     text = text or ""
+    # Deliberately outside the try: silently scoring un-normalized text would make
+    # WER/CER incomparable with previously recorded runs.
+    normalizer = _get_normalizer()
     try:
-        text = _get_normalizer().normalize(text, verbose=False)
+        text = normalizer.normalize(text, verbose=False)
     except Exception as e:
         print(f"[normalize_text] NeMo normalization failed for {text!r} ({e}); using raw text.")
-    return " ".join(text.lower().strip().split())
-
+    # Apostrophes are dropped, not spaced, so "can't" and "cant" score as one token.
+    text = _APOSTROPHE_RE.sub("", text)
+    text = _PUNCTUATION_RE.sub(" ", text)
+    return " ".join(text.lower().split())
 
 
 def levenshtein_distance(ref: Sequence[str], hyp: Sequence[str]) -> int:
@@ -132,24 +144,22 @@ def find_audio_files(directory: Path) -> list[Path]:
     return sorted(wavs, key=lambda p: p.name)
 
 
-def _transcribe_batch_qwen_asr(
+def _transcribe_batch(
     model,
     processor,
     audios: list,
+    sampling_rate: int,
     language: str,
 ) -> list[str]:
-    inputs = processor.apply_transcription_request(audio=audios, language=language)
-    inputs = inputs.to(model.device, dtype=getattr(model, "dtype", torch.float32))
+    inputs = processor(audios, sampling_rate=sampling_rate, return_tensors="pt", language=language)
+    inputs = inputs.to(model.device, dtype=model.dtype)
 
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=256)
 
-    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
-    # decode()/parse_output() assume a single sequence for 2D batches; batch_decode +
-    # extract_transcription is the batch-safe path (both explicitly accept list[str]).
-    raw_texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
-    texts = processor.extract_transcription(raw_texts)
-    return texts if isinstance(texts, list) else [texts]
+    # generate() returns the decoder prompt as a prefix; drop it before decoding.
+    prompt_len = inputs["decoder_input_ids"].shape[1]
+    return processor.batch_decode(output_ids[:, prompt_len:], skip_special_tokens=True)
 
 
 def transcribe_batch(
@@ -160,7 +170,7 @@ def transcribe_batch(
     sampling_rate: int = DEFAULT_SAMPLE_RATE,
     language: str = "en",
 ) -> list[str]:
-    """Batch-transcribe a list of audio files using Qwen3-ASR."""
+    """Batch-transcribe a list of audio files using Cohere ASR."""
     if not audio_paths:
         return []
 
@@ -168,13 +178,15 @@ def transcribe_batch(
     for start in range(0, len(audio_paths), batch_size):
         chunk = audio_paths[start : start + batch_size]
         audios = [load_audio(str(path), sampling_rate=sampling_rate) for path in chunk]
-        results.extend(_transcribe_batch_qwen_asr(model, processor, audios, language=language))
+        results.extend(
+            _transcribe_batch(model, processor, audios, sampling_rate=sampling_rate, language=language)
+        )
 
     return results
 
 
 def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
-    """Load the Qwen3-ASR processor/model pair for WER/CER evaluation.
+    """Load the Cohere ASR processor/model pair for WER/CER evaluation.
 
     HF/accelerate's device_map="auto" dispatch doesn't reliably detect Intel XPU and
     silently falls back to CPU (dramatically slower for a model this size), so pin an
@@ -189,10 +201,12 @@ def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
 
     torch_dtype = torch.bfloat16 if (torch.xpu.is_available() or torch.cuda.is_available()) else torch.float32
 
-    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, device_map=device_map, torch_dtype=torch_dtype)
+    model = CohereAsrForConditionalGeneration.from_pretrained(
+        model_name, device_map=device_map, torch_dtype=torch_dtype
+    )
     return processor, model
 
 
@@ -324,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=DEFAULT_MODEL,
-        help="Qwen ASR model ID used for WER/CER transcription.",
+        help="Cohere ASR model ID used for WER/CER transcription.",
     )
     parser.add_argument(
         "--batch-size",

@@ -22,3 +22,6 @@ python "$REPO_ROOT/src/evaluate.py" \
     --top-p 0.9 \
     --repetition-penalty 1.1 \
     --seed 0
+
+# evaluate.py leaves WER/CER blank; fill them in from the audio just generated.
+"$SCRIPT_DIR/transcribe.sh" "$REPO_ROOT/outputs/evaluation/Llama-OuteTTS-1.0-1B"

@@ -6,28 +6,38 @@ shared workbook instead of writing separate scores_*.json / acoustics_*.json /
 codebook_divergence.json / transcription.json files per run, so results across
 models and quant types stay comparable in one place.
 
-Sheets:
-  Summary      - one metric per row, one column per (model, quant_type)
-  PerSample    - one row per (model, quant_type, sample_id): aggregated per-sample stats,
-                 plus ground truth / baseline / quant transcript text
-  LogProbs_KL  - one row per (model, quant_type, sample_id, step): baseline and quant
-                 token ids (both LLM-vocab and codec-space) and probabilities kept
-                 adjacent for direct comparison, plus per-step KL/JS/argmax-match/
-                 top-k-jaccard. Row-level, not bucketed by codec/frame position
-                 (codebook_id is kept as an informational column). Only populated for
-                 models where teacher forcing is supported.
-  Codec        - one row per (model, quant_type, sample_id, hierarchy_level): codebook
-                 divergence rates from the RVQ/FSQ hierarchy breakdown
+All visible sheets are laid out with metric columns grouped (stacked) under a
+quant_type header band, so the same metric can be compared side by side across
+quant types on one row:
 
-"_SummaryData" is a hidden helper sheet holding the Summary metrics in long
-format (metric, model, quant_type, value); it's the persisted source of truth
-that the wide "Summary" sheet is pivoted from on every write.
+  Summary      - one metric per row, one column per (model, quant_type)
+  PerSample    - one row per (model, sample_id); columns grouped per quant_type:
+                 aggregated per-sample stats plus baseline / quant transcript text
+  LogProbs_KL  - one row per (model, sample_id, step); columns grouped per quant_type:
+                 baseline and quant token ids (both LLM-vocab and codec-space) and
+                 probabilities kept adjacent for direct comparison, plus per-step
+                 KL/JS/argmax-match/top-k-jaccard. Row-level, not bucketed by
+                 codec/frame position (codebook_id is an informational index column).
+                 Only populated for models where teacher forcing is supported.
+  Codec        - one row per (model, sample_id, hierarchy_level); columns grouped per
+                 quant_type: codebook divergence rates from the RVQ/FSQ hierarchy
+                 breakdown
+
+The "_*Data" sheets are hidden helpers holding each table in long format (one
+row per model/quant_type); they are the persisted source of truth that the wide
+visible sheets are pivoted from on every write.
+
+Writes take an exclusive file lock so concurrent evaluation jobs sharing one
+workbook can't clobber each other's rows (lost update -> "only the last quant
+type is in the report").
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +54,38 @@ LOGPROBS_SHEET = "LogProbs_KL"
 CODEC_SHEET = "Codec"
 SUMMARY_SHEET = "Summary"
 SUMMARY_DATA_SHEET = "_SummaryData"
+PER_SAMPLE_DATA_SHEET = "_PerSampleData"
+LOGPROBS_DATA_SHEET = "_LogProbsData"
+CODEC_DATA_SHEET = "_CodecData"
 
 _KEY_COLS = ["model", "quant_type"]
 _RUN_LABEL_COLS = ["comparison", "baseline_run", "quant_run"]
+
+# Columns that identify a row in the wide layout; everything else becomes a
+# per-quant_type column group.
+_PER_SAMPLE_ID_COLS = ["model", "sample_id", "ground_truth_text"]
+_LOGPROBS_ID_COLS = ["model", "sample_id", "ground_truth_text", "step", "codebook_id"]
+_CODEC_ID_COLS = [
+    "model",
+    "sample_id",
+    "ground_truth_text",
+    "codec_family",
+    "tokens_per_frame",
+    "hierarchy_level",
+]
+
+
+@contextmanager
+def _report_lock(report_path: Path):
+    """Serialize read-modify-write cycles across concurrently running jobs."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = report_path.with_name(report_path.name + ".lock")
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _comparison_label(quant_type: str) -> str:
@@ -78,6 +117,17 @@ def _read_sheet(report_path: Path, sheet_name: str, columns: list[str]) -> pd.Da
         return pd.read_excel(report_path, sheet_name=sheet_name)
     except (ValueError, KeyError):
         return pd.DataFrame(columns=columns)
+
+
+def _read_long(report_path: Path, data_sheet: str, legacy_sheet: str, columns: list[str]) -> pd.DataFrame:
+    """Read the long-format source of truth, falling back to pre-wide-layout workbooks."""
+    stored = _read_sheet(report_path, data_sheet, columns)
+    if not stored.empty:
+        return stored
+    legacy = _read_sheet(report_path, legacy_sheet, columns)
+    if "quant_type" in legacy.columns:  # old workbooks kept the long rows on the visible sheet
+        return legacy
+    return pd.DataFrame(columns=columns)
 
 
 def _upsert(existing: pd.DataFrame, new_rows: pd.DataFrame, model: str, quant_type: str) -> pd.DataFrame:
@@ -342,14 +392,44 @@ def _codec_rows(model: str, quant_type: str, codebook_per_sample: list[dict[str,
     return pd.DataFrame(rows)
 
 
-def _style_sheet(ws) -> None:
-    """Bold header row, freeze it, and auto-size columns for readability."""
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    ws.freeze_panes = "A2"
-    for col_idx, col_cells in enumerate(ws.columns, start=1):
+def _pivot_by_quant(df: pd.DataFrame, id_cols: list[str]) -> pd.DataFrame:
+    """Long rows -> one row per id_cols with metric columns stacked under each quant_type."""
+    if df.empty or "quant_type" not in df.columns:
+        return pd.DataFrame()
+    frame = df.copy()
+    ids = [col for col in id_cols if col in frame.columns]
+    value_cols = [col for col in frame.columns if col not in ids and col not in _RUN_LABEL_COLS and col != "quant_type"]
+    if not ids or not value_cols:
+        return pd.DataFrame()
+    frame = frame.drop_duplicates(subset=[*ids, "quant_type"], keep="last")
+    quant_types = sorted(frame["quant_type"].astype(str).unique())
+    frame["quant_type"] = frame["quant_type"].astype(str)
+
+    wide = frame.set_index([*ids, "quant_type"])[value_cols].unstack("quant_type")
+    wide.columns = wide.columns.swaplevel(0, 1)
+    wide = wide.reindex(columns=pd.MultiIndex.from_product([quant_types, value_cols]))
+    wide.columns.names = ["quant_type", "metric"]
+    return wide.sort_index()
+
+
+def _style_sheet(ws, header_rows: int = 1, index_cols: int = 0) -> None:
+    """Bold the header band, freeze it, and auto-size columns for readability."""
+    for row in range(1, header_rows + 1):
+        for cell in ws[row]:
+            cell.font = Font(bold=True)
+    ws.freeze_panes = f"{get_column_letter(index_cols + 1)}{header_rows + 1}"
+    for col_idx, col_cells in enumerate(ws.iter_cols(max_row=min(ws.max_row, 200)), start=1):
         best_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(best_len + 2, 10), 60)
+
+
+def _write_wide_sheet(writer, wide: pd.DataFrame, sheet_name: str, id_cols: list[str]) -> None:
+    if wide.empty:
+        pd.DataFrame().to_excel(writer, sheet_name=sheet_name)
+        return
+    wide.to_excel(writer, sheet_name=sheet_name, merge_cells=True)
+    # pandas emits: row1 quant_type band, row2 metric names, row3 index labels.
+    _style_sheet(writer.sheets[sheet_name], header_rows=3, index_cols=wide.index.nlevels)
 
 
 def _write_workbook(
@@ -371,17 +451,21 @@ def _write_workbook(
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
         summary_wide.to_excel(writer, sheet_name=SUMMARY_SHEET)
-        per_sample.to_excel(writer, sheet_name=PER_SAMPLE_SHEET, index=False)
-        logprobs_kl.to_excel(writer, sheet_name=LOGPROBS_SHEET, index=False)
-        codec.to_excel(writer, sheet_name=CODEC_SHEET, index=False)
-        summary_long.to_excel(writer, sheet_name=SUMMARY_DATA_SHEET, index=False)
+        _write_wide_sheet(writer, _pivot_by_quant(per_sample, _PER_SAMPLE_ID_COLS), PER_SAMPLE_SHEET, _PER_SAMPLE_ID_COLS)
+        _write_wide_sheet(writer, _pivot_by_quant(logprobs_kl, _LOGPROBS_ID_COLS), LOGPROBS_SHEET, _LOGPROBS_ID_COLS)
+        _write_wide_sheet(writer, _pivot_by_quant(codec, _CODEC_ID_COLS), CODEC_SHEET, _CODEC_ID_COLS)
 
-        for name in (PER_SAMPLE_SHEET, LOGPROBS_SHEET, CODEC_SHEET):
-            _style_sheet(writer.sheets[name])
-        writer.sheets[SUMMARY_SHEET].freeze_panes = "B3"
-        for cell in writer.sheets[SUMMARY_SHEET][2]:
-            cell.font = Font(bold=True)
-        writer.sheets[SUMMARY_DATA_SHEET].sheet_state = "hidden"
+        summary_long.to_excel(writer, sheet_name=SUMMARY_DATA_SHEET, index=False)
+        per_sample.to_excel(writer, sheet_name=PER_SAMPLE_DATA_SHEET, index=False)
+        logprobs_kl.to_excel(writer, sheet_name=LOGPROBS_DATA_SHEET, index=False)
+        codec.to_excel(writer, sheet_name=CODEC_DATA_SHEET, index=False)
+
+        writer.sheets[SUMMARY_SHEET].freeze_panes = "B4"
+        for row in (1, 2):
+            for cell in writer.sheets[SUMMARY_SHEET][row]:
+                cell.font = Font(bold=True)
+        for name in (SUMMARY_DATA_SHEET, PER_SAMPLE_DATA_SHEET, LOGPROBS_DATA_SHEET, CODEC_DATA_SHEET):
+            writer.sheets[name].sheet_state = "hidden"
 
 
 def update_report(
@@ -418,31 +502,32 @@ def update_report(
         dist_per_sample, model_name=model, tokens_per_frame=dist_summary.get("tokens_per_frame"),
     )
 
-    summary_long = _upsert(
-        _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"]),
-        _summary_rows(model, quant_type, scores_summary, dist_summary, acoustics_summary,
-                      codebook_summary, baseline_transcription, quant_transcription,
-                      ftdr, teacher_forced_hierarchy),
-        model, quant_type,
-    )
-    per_sample = _upsert(
-        _read_sheet(report_path, PER_SAMPLE_SHEET, [*_KEY_COLS, "sample_id"]),
-        _per_sample_rows(model, quant_type, per_sample_scores, acoustics_per_sample, codebook_per_sample,
-                          baseline_transcription.get("samples", []), quant_transcription.get("samples", [])),
-        model, quant_type,
-    )
-    logprobs_kl = _upsert(
-        _read_sheet(report_path, LOGPROBS_SHEET, [*_KEY_COLS, "sample_id", "step"]),
-        _logprobs_kl_rows(model, quant_type, dist_per_sample, audio_token_start),
-        model, quant_type,
-    )
-    codec = _upsert(
-        _read_sheet(report_path, CODEC_SHEET, [*_KEY_COLS, "sample_id", "hierarchy_level"]),
-        _codec_rows(model, quant_type, codebook_per_sample),
-        model, quant_type,
-    )
+    with _report_lock(report_path):
+        summary_long = _upsert(
+            _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"]),
+            _summary_rows(model, quant_type, scores_summary, dist_summary, acoustics_summary,
+                          codebook_summary, baseline_transcription, quant_transcription,
+                          ftdr, teacher_forced_hierarchy),
+            model, quant_type,
+        )
+        per_sample = _upsert(
+            _read_long(report_path, PER_SAMPLE_DATA_SHEET, PER_SAMPLE_SHEET, [*_KEY_COLS, "sample_id"]),
+            _per_sample_rows(model, quant_type, per_sample_scores, acoustics_per_sample, codebook_per_sample,
+                              baseline_transcription.get("samples", []), quant_transcription.get("samples", [])),
+            model, quant_type,
+        )
+        logprobs_kl = _upsert(
+            _read_long(report_path, LOGPROBS_DATA_SHEET, LOGPROBS_SHEET, [*_KEY_COLS, "sample_id", "step"]),
+            _logprobs_kl_rows(model, quant_type, dist_per_sample, audio_token_start),
+            model, quant_type,
+        )
+        codec = _upsert(
+            _read_long(report_path, CODEC_DATA_SHEET, CODEC_SHEET, [*_KEY_COLS, "sample_id", "hierarchy_level"]),
+            _codec_rows(model, quant_type, codebook_per_sample),
+            model, quant_type,
+        )
 
-    _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
+        _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
 
 
 def update_transcription_report(
@@ -453,58 +538,70 @@ def update_transcription_report(
     quant_transcription: dict[str, Any],
 ) -> None:
     """Upsert WER/CER transcription results into an existing report workbook."""
-    summary_long = _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"])
-    per_sample = _read_sheet(report_path, PER_SAMPLE_SHEET, [*_KEY_COLS, "sample_id"])
-    logprobs_kl = _read_sheet(report_path, LOGPROBS_SHEET, [*_KEY_COLS, "sample_id", "step"])
-    codec = _read_sheet(report_path, CODEC_SHEET, [*_KEY_COLS, "sample_id", "hierarchy_level"])
+    with _report_lock(report_path):
+        summary_long = _read_sheet(report_path, SUMMARY_DATA_SHEET, ["metric", *_KEY_COLS, "value"])
+        per_sample = _read_long(report_path, PER_SAMPLE_DATA_SHEET, PER_SAMPLE_SHEET, [*_KEY_COLS, "sample_id"])
+        logprobs_kl = _read_long(report_path, LOGPROBS_DATA_SHEET, LOGPROBS_SHEET, [*_KEY_COLS, "sample_id", "step"])
+        codec = _read_long(report_path, CODEC_DATA_SHEET, CODEC_SHEET, [*_KEY_COLS, "sample_id", "hierarchy_level"])
 
-    metric_values = {
-        "baseline_wer": baseline_transcription.get("mean_wer"),
-        "baseline_cer": baseline_transcription.get("mean_cer"),
-        "quant_wer": quant_transcription.get("mean_wer"),
-        "quant_cer": quant_transcription.get("mean_cer"),
-    }
-    new_summary = pd.DataFrame(
-        {
-            "metric": list(metric_values),
-            "model": model,
-            "quant_type": quant_type,
-            "value": list(metric_values.values()),
+        metric_values = {
+            "baseline_wer": baseline_transcription.get("mean_wer"),
+            "baseline_cer": baseline_transcription.get("mean_cer"),
+            "quant_wer": quant_transcription.get("mean_wer"),
+            "quant_cer": quant_transcription.get("mean_cer"),
         }
-    )
-    if not summary_long.empty:
-        mask = (summary_long["model"] == model) & (summary_long["quant_type"] == quant_type) & (
-            summary_long["metric"].isin(metric_values)
+        new_summary = pd.DataFrame(
+            {
+                "metric": list(metric_values),
+                "model": model,
+                "quant_type": quant_type,
+                "value": list(metric_values.values()),
+            }
         )
-        summary_long = summary_long.loc[~mask]
-    summary_long = pd.concat([summary_long, new_summary], ignore_index=True)
+        if not summary_long.empty:
+            mask = (summary_long["model"] == model) & (summary_long["quant_type"] == quant_type) & (
+                summary_long["metric"].isin(metric_values)
+            )
+            summary_long = summary_long.loc[~mask]
+        summary_long = pd.concat([summary_long, new_summary], ignore_index=True)
 
-    if per_sample.empty:
-        raise ValueError(f"{report_path} has no {PER_SAMPLE_SHEET!r} rows to update.")
+        if per_sample.empty:
+            raise ValueError(f"{report_path} has no {PER_SAMPLE_SHEET!r} rows to update.")
 
-    mask = (per_sample["model"] == model) & (per_sample["quant_type"] == quant_type)
-    row_indices = list(per_sample.index[mask])
-    baseline_samples = baseline_transcription.get("samples", [])
-    quant_samples = quant_transcription.get("samples", [])
+        mask = (per_sample["model"] == model) & (per_sample["quant_type"] == quant_type)
+        row_indices = list(per_sample.index[mask])
+        baseline_samples = baseline_transcription.get("samples", [])
+        quant_samples = quant_transcription.get("samples", [])
 
-    for offset, row_index in enumerate(row_indices):
-        baseline_t = baseline_samples[offset] if offset < len(baseline_samples) else {}
-        quant_t = quant_samples[offset] if offset < len(quant_samples) else {}
-        labels = _run_labels(quant_type)
-        for column, value in labels.items():
-            per_sample.loc[row_index, column] = value
-        per_sample.loc[row_index, "baseline_transcript"] = baseline_t.get("transcript")
-        per_sample.loc[row_index, "baseline_wer"] = baseline_t.get("wer")
-        per_sample.loc[row_index, "baseline_cer"] = baseline_t.get("cer")
-        per_sample.loc[row_index, "quant_transcript"] = quant_t.get("transcript")
-        per_sample.loc[row_index, "quant_wer"] = quant_t.get("wer")
-        per_sample.loc[row_index, "quant_cer"] = quant_t.get("cer")
-        if baseline_t.get("wer") is not None and quant_t.get("wer") is not None:
-            per_sample.loc[row_index, "wer_delta_vs_baseline"] = quant_t.get("wer") - baseline_t.get("wer")
-        if baseline_t.get("cer") is not None and quant_t.get("cer") is not None:
-            per_sample.loc[row_index, "cer_delta_vs_baseline"] = quant_t.get("cer") - baseline_t.get("cer")
+        def column(samples: list[dict[str, Any]], key: str) -> list[Any]:
+            return [samples[i].get(key) if i < len(samples) else None for i in range(len(row_indices))]
 
-    _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
+        def delta(baseline: list[Any], quant: list[Any]) -> list[Any]:
+            return [q - b if b is not None and q is not None else None for b, q in zip(baseline, quant)]
+
+        baseline_wer, baseline_cer = column(baseline_samples, "wer"), column(baseline_samples, "cer")
+        quant_wer, quant_cer = column(quant_samples, "wer"), column(quant_samples, "cer")
+
+        updates: dict[str, Any] = {
+            **_run_labels(quant_type),
+            "baseline_transcript": column(baseline_samples, "transcript"),
+            "quant_transcript": column(quant_samples, "transcript"),
+            "baseline_wer": baseline_wer,
+            "baseline_cer": baseline_cer,
+            "quant_wer": quant_wer,
+            "quant_cer": quant_cer,
+            "wer_delta_vs_baseline": delta(baseline_wer, quant_wer),
+            "cer_delta_vs_baseline": delta(baseline_cer, quant_cer),
+        }
+        for name, values in updates.items():
+            # These round-trip from Excel as all-NaN float64 when evaluate.py left them
+            # blank; writing strings into that dtype raises in pandas 3.
+            per_sample[name] = (
+                per_sample[name].astype(object) if name in per_sample.columns else pd.Series(index=per_sample.index, dtype=object)
+            )
+            per_sample.loc[row_indices, name] = values
+
+        _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
 
 
 __all__ = ["update_report", "update_transcription_report"]

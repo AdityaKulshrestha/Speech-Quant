@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# Qwen3 TTS baseline vs every rtn/gptq/awq/sq quant flavour at 4bit and 8bit.
-# Speakers: Ethan, Serena, Cherry, Tom, Emily, Anna, Ashley, Eric
+# Sample invocation of src/evaluate.py: runs the supported Qwen baseline.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# All rtn/gptq/awq/sq x 4bit/8bit combinations (see src/quants/config.py).
-QUANT_TYPES="rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit"
+cd "$REPO_ROOT"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
 
-python "$REPO_ROOT/src/evaluate.py" \
+# Qwen's specialized talker does not yet support the shared quantization path.
+QUANT_TYPES="none"
+
+"$REPO_ROOT/.venv-qwen/bin/python" "$REPO_ROOT/src/evaluate.py" \
     --model qwen \
-    --model-name Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --model-name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --quant-type "$QUANT_TYPES" \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
     --num-samples 50 \
     --output-dir "$REPO_ROOT/outputs" \
-    --voice Ethan \
     --device xpu \
     --max-new-tokens 2048 \
     --temperature 0.9 \
     --seed 0
+
+# evaluate.py leaves WER/CER blank; fill them in from the audio just generated.
+"$SCRIPT_DIR/transcribe.sh" "$REPO_ROOT/outputs/evaluation/Qwen3-TTS-12Hz-1.7B-CustomVoice"

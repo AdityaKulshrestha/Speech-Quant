@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Qwen ASR WER/CER on existing generated audio and upsert the report.
+"""Run Cohere ASR WER/CER on existing generated audio and upsert the report.
 
 This is intentionally separate from src/evaluate.py: generation/quantization writes
 manifests and non-ASR metrics first, then this script can be run later against the
@@ -22,7 +22,7 @@ REPO_ROOT = SRC_DIR.parent
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Append Qwen-ASR WER/CER results to analysis_report.xlsx.")
+    parser = argparse.ArgumentParser(description="Append Cohere-ASR WER/CER results to analysis_report.xlsx.")
     parser.add_argument(
         "--audio-root",
         type=Path,
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--asr-model",
         default=None,
-        help="Qwen ASR checkpoint id/path. Defaults to evaluation.transcription.DEFAULT_MODEL.",
+        help="Cohere ASR checkpoint id/path. Defaults to evaluation.transcription.DEFAULT_MODEL.",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--sampling-rate", type=int, default=16000)
