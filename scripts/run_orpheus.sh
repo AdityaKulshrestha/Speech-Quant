@@ -10,14 +10,14 @@ cd "$REPO_ROOT"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
 
 # All rtn/gptq/awq/sq x 4bit/8bit combinations (see src/quants/config.py).
-QUANT_TYPES="gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit"
+QUANT_TYPES="rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit"
 
 uv run --locked --no-sync python "$REPO_ROOT/src/evaluate.py" \
     --model orpheus \
     --model-name canopylabs/orpheus-3b-0.1-ft \
     --quant-type "$QUANT_TYPES" \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
-    --num-samples 5 \
+    --num-samples 50 \
     --output-dir "$REPO_ROOT/outputs" \
     --voice tara \
     --device xpu \

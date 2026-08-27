@@ -17,3 +17,4 @@ logs
 .opencode-trace
 CLAUDE.md
 .venv*
+slurm_scripts

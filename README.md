@@ -1,47 +1,123 @@
-Good — that's a smart starting point since first-token divergence gives you a clean, cheap signal before you commit to full generation pipelines. Here's how I'd expand that into a full methodology for capturing and understanding PTQ behavior on the AR model.
+# Speech-Quant: Quantization Effects in Neural-Codec Speech Models
 
-## 1. Sensitivity analysis (before/instead of picking a PTQ method blindly)
+Speech-Quant studies how post-training quantization changes autoregressive text-to-speech models that generate discrete neural-codec tokens. The main question is simple: when we compress the language-model backbone, where does speech quality start to fail, and which metrics reveal the failure earliest?
 
-This tells you *where* quantization will hurt before you spend compute quantizing everything uniformly.
+This codebase compares full-precision baselines against several quantized variants across neural-codec TTS models such as Orpheus, NeuTTS, OuteTTS, and Qwen3-TTS. It is intended to support research experiments and paper figures, not to serve as a production TTS toolkit.
 
-- **Hessian-based sensitivity** (as in GPTQ/OBQ lineage) — approximate per-layer/per-weight loss curvature to rank which layers are fragile. In codec-token AR models, expect the output projection (to codebook vocabulary) and early transformer blocks to be more sensitive than middle layers, similar to text LLMs.
-- **Weight and activation outlier analysis** — plot per-channel magnitude distributions (like the SmoothQuant/LLM.int8() outlier-feature analysis). Audio-token embedding spaces often have different outlier structure than text because codebook indices don't carry the same "semantic frequency" distribution as word tokens — worth checking whether outliers cluster in specific channels or specific codebook-index ranges.
-- **Layer-wise cosine similarity / drift** — compare hidden states of FP16 vs quantized model at every layer, not just output. This localizes *where in the network* error is introduced vs where it's merely propagated.
+## Why This Study
 
-## 2. PTQ methods to actually apply and compare
+Autoregressive speech models can generate long token sequences, so small distribution shifts from quantization may compound over time. Standard end metrics such as WER or perceptual quality are important, but they do not explain when the model first diverged or whether a specific codec level is more fragile.
 
-Don't just pick one — a workshop paper is much stronger if it's a controlled comparison:
+Speech-Quant therefore records both final speech quality and token-level behavior. This makes it possible to connect quantization precision, codec-token divergence, teacher-forced distribution shift, and downstream intelligibility in one experiment.
 
-- **RTN (round-to-nearest)** as your naive baseline — necessary to show that "smarter" PTQ matters.
-- **GPTQ** — layer-wise reconstruction using Hessian info; strong general baseline.
-- **AWQ** — activation-aware, protects salient weight channels; worth testing since it's often more robust at low bit-widths.
-- **SmoothQuant** — if you're also quantizing activations, not just weights, since AR codec models with long sequences will be activation/KV-bound at inference.
-- **KV-cache quantization (KIVI, H2O, or simple per-channel KV quant)** — likely your most *practically relevant* result, since AR decoding over long audio sequences is KV-cache-memory-dominated. This is under-explored for audio and could be your paper's differentiator.
-- Bit-width sweep: 8-bit, 4-bit, and maybe 3-bit to show a degradation curve, not just a single operating point.
+## Setup
 
-## 3. Extending "first codec divergence" into a full divergence-over-time story
+The project uses `uv` and Python 3.12.
 
-This is the part I'd push hardest on, since it's the most novel angle and builds directly on what you've already started.
+```bash
+cd Speech-Quant
+uv venv .venv-orpheus --python 3.12
+source .venv-orpheus/bin/activate
+UV_PROJECT_ENVIRONMENT=.venv-orpheus uv sync --group orpheus
+```
 
-- **Per-step divergence trajectory**: compute KL or JS divergence between FP16 and quantized next-token distributions at *every* AR step (not just the first), and plot divergence vs generation step. This shows whether errors compound, saturate, or self-correct.
-- **Per-codebook-level divergence**: if your AR model predicts a codebook hierarchy (coarse/semantic token first, finer acoustic tokens after, as in VALL-E-style or RVQ-flattened models), break divergence down *by codebook depth*. Hypothesis worth testing: quantization hurts the first (semantic) codebook less than later (acoustic/fine-detail) codebooks, or vice versa — either result is a genuinely interesting finding.
-- **Token-level edit distance / argmax mismatch rate** as a cheaper, more interpretable companion to KL divergence — "what fraction of generated tokens differ from the FP16 model's greedy choice at each step."
-- **Cumulative divergence vs sequence length** — bucket generations by length and show whether long-form generation is disproportionately affected. This is a natural bridge to your stability/hallucination metrics below.
-- **Wasserstein/earth-mover's distance** between full output token-probability distributions as an alternative to KL when distributions have disjoint support (common at very low bit-widths where quantized model assigns near-zero probability to many tokens).
+### Why Separate Environments
 
-## 4. Downstream behavioral evaluation (ties divergence numbers to perceptual impact)
+The supported speech models depend on different codec packages, PyTorch builds, and `transformers` versions. Keeping separate environments avoids dependency conflicts and makes each model run reproducible.
 
-Divergence metrics are necessary but reviewers will want to see they *matter*:
+Recommended environments:
 
-- **WER** (via Whisper) — does divergence translate into intelligibility loss?
-- **Speaker similarity** (WavLM/ECAPA embeddings) — does quantization noise bleed into speaker identity, especially if it hits acoustic-detail codebooks harder?
-- **UTMOS or similar naturalness proxy**
-- **Repetition/hallucination/premature-stop rate** — AR models are prone to degenerate loops; check if quantization increases this, since divergence compounding could plausibly manifest exactly as runaway repetition.
-- Correlate all of these against your per-step divergence curves — a scatter of "divergence at step N vs downstream WER" is a compelling figure.
+| environment | dependency group | intended model family |
+|---|---|---|
+| `.venv-orpheus` | `orpheus` | Orpheus / SNAC |
+| `.venv-neutts` | `neutts` | NeuTTS / NeuCodec |
+| `.venv-outetts` | `outetts` | OuteTTS / DAC |
+| `.venv-qwen` | `qwen-tts` | Qwen3-TTS |
 
-## 5. Practical tooling recommendations
+Create another environment by changing both names:
 
-- Use a **fixed calibration set** across methods for fair comparison, but also run a small ablation on calibration data source (codec-token sequences vs random/text-derived) since this is an easy, cheap, and reviewer-friendly ablation.
-- Log everything at the **token-probability level**, not just final audio, so you can compute all divergence metrics post-hoc without re-running generation.
-- Consider **bootstrap confidence intervals** on your metrics given TTS/audio-gen eval noise — workshop reviewers increasingly expect this given how noisy MOS/WER proxies can be.
+```bash
+uv venv .venv-neutts --python 3.12
+source .venv-neutts/bin/activate
+UV_PROJECT_ENVIRONMENT=.venv-neutts uv sync --group neutts
+```
+
+## Running Experiments
+
+Run one of the model scripts after activating the matching environment:
+
+```bash
+source .venv-orpheus/bin/activate
+bash scripts/run_orpheus.sh
+```
+
+The scripts compare one full-precision baseline against the configured quantization methods:
+
+```text
+rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit
+```
+
+You can also call the evaluator directly:
+
+```bash
+python src/evaluate.py \
+	--model orpheus \
+	--model-name canopylabs/orpheus-3b-0.1-ft \
+	--quant-type gptq-4bit,awq-4bit,sq-8bit \
+	--prompts-file src/prompts.txt \
+	--num-samples 50 \
+	--output-dir outputs \
+	--device xpu \
+	--seed 0
+```
+
+The active quantization settings are defined in `src/quants/config.py`:
+
+| quant type | precision |
+|---|---|
+| `rtn-4bit`, `gptq-4bit` | `W4A16` |
+| `rtn-8bit`, `gptq-8bit`, `awq-8bit` | `W8A16` |
+| `awq-4bit` | `W4A16_ASYM` |
+| `sq-4bit` | `W4A8` |
+| `sq-8bit` | `W8A8` |
+
+Only SmoothQuant (`sq-*`) quantizes activations to 8-bit. RTN, GPTQ, and AWQ are weight-only in this repository.
+
+## Outputs
+
+Each run writes generated audio, manifests, plots, and a consolidated report under `outputs/`.
+
+The main artifact for analysis is:
+
+```text
+outputs/evaluation/analysis_report.xlsx
+```
+
+Important sheets:
+
+| sheet | content |
+|---|---|
+| `Summary` | one metric per row, grouped by model and quantization type |
+| `PerSample` | per-prompt WER, CER, acoustic scores, divergence scores, and transcripts |
+| `LogProbs_KL` | teacher-forced per-step probability, KL/JS, argmax, and token data |
+| `Codec` | codec-level divergence by sample and hierarchy level |
+
+Rows are updated by `(model, quant_type)`. Rerunning one quantization setting replaces only that setting's rows in the report.
+
+## Metrics Covered
+
+Speech-Quant records metrics at three levels:
+
+| group | metrics |
+|---|---|
+| intelligibility | WER and CER from ASR transcripts |
+| acoustic quality | Mel-Cepstral Distortion, F0 frame error, pitch correlation, UTMOS |
+| token divergence | first token divergence rate, free-run divergence, codec-level mismatch rate |
+| teacher-forced distributions | KL divergence, Jensen-Shannon divergence, argmax mismatch rate, top-k overlap, NLL, perplexity |
+
+The teacher-forced metrics are the cleanest way to compare model distributions because the baseline and quantized model are evaluated on the same prefix at each step. The free-run metrics remain useful for measuring how divergence appears in actual sampled generation.
+
+## License
+
+This project is released under the MIT License. See `LICENSE` for details.
 

@@ -26,6 +26,8 @@ that the wide "Summary" sheet is pivoted from on every write.
 
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,29 @@ SUMMARY_SHEET = "Summary"
 SUMMARY_DATA_SHEET = "_SummaryData"
 
 _KEY_COLS = ["model", "quant_type"]
+_RUN_LABEL_COLS = ["comparison", "baseline_run", "quant_run"]
+
+
+def _comparison_label(quant_type: str) -> str:
+    return f"baseline_vs_{quant_type}"
+
+
+def _run_labels(quant_type: str) -> dict[str, str]:
+    return {
+        "comparison": _comparison_label(quant_type),
+        "baseline_run": "baseline",
+        "quant_run": quant_type,
+    }
+
+
+def _move_columns_after(df: pd.DataFrame, anchor: str, columns: list[str]) -> pd.DataFrame:
+    ordered = list(df.columns)
+    moved = [col for col in columns if col in ordered]
+    if anchor not in ordered or not moved:
+        return df
+    remainder = [col for col in ordered if col not in moved]
+    anchor_index = remainder.index(anchor) + 1
+    return df[remainder[:anchor_index] + moved + remainder[anchor_index:]]
 
 
 def _read_sheet(report_path: Path, sheet_name: str, columns: list[str]) -> pd.DataFrame:
@@ -122,6 +147,15 @@ def _summary_rows(
         metrics["teacher_forced_mean_nll_quant"] = dist_summary.get("mean_nll_quant")
         metrics["teacher_forced_perplexity_baseline"] = dist_summary.get("perplexity_baseline")
         metrics["teacher_forced_perplexity_quant"] = dist_summary.get("perplexity_quant")
+        metrics["num_samples_with_first_token_divergence"] = dist_summary.get(
+            "num_samples_with_first_token_divergence"
+        )
+        metrics["num_samples_with_any_teacher_forced_argmax_mismatch"] = dist_summary.get(
+            "num_samples_with_any_teacher_forced_argmax_mismatch"
+        )
+        metrics["mean_first_teacher_forced_mismatch_position"] = dist_summary.get(
+            "mean_first_teacher_forced_mismatch_position"
+        )
         for key, value in dist_summary.items():
             if key.startswith("mean_top") and key.endswith("_jaccard"):
                 metrics[f"teacher_forced_{key}"] = value
@@ -138,6 +172,15 @@ def _summary_rows(
     return pd.DataFrame(
         {"metric": list(metrics.keys()), "model": model, "quant_type": quant_type, "value": list(metrics.values())}
     )
+
+
+def _first_teacher_forced_mismatch_positions(dist_per_sample: list[dict[str, Any]]) -> list[int | None]:
+    positions = []
+    for entry in dist_per_sample:
+        mismatches = (entry.get("per_step") or {}).get("argmax_mismatch") or []
+        first = next((idx for idx, mismatch in enumerate(mismatches) if bool(mismatch)), None)
+        positions.append(first)
+    return positions
 
 
 def _per_sample_rows(
@@ -159,19 +202,30 @@ def _per_sample_rows(
         codebook = codebook_by_id.get(sample_id, {})
         baseline_t = baseline_samples[i] if i < len(baseline_samples) else {}
         quant_t = quant_samples[i] if i < len(quant_samples) else {}
+        baseline_wer = baseline_t.get("wer")
+        baseline_cer = baseline_t.get("cer")
+        quant_wer = quant_t.get("wer")
+        quant_cer = quant_t.get("cer")
 
         rows.append(
             {
                 "model": model,
                 "quant_type": quant_type,
+                **_run_labels(quant_type),
                 "sample_id": sample_id,
                 "ground_truth_text": score.get("text"),
                 "baseline_transcript": baseline_t.get("transcript"),
                 "quant_transcript": quant_t.get("transcript"),
-                "baseline_wer": baseline_t.get("wer"),
-                "baseline_cer": baseline_t.get("cer"),
-                "quant_wer": quant_t.get("wer"),
-                "quant_cer": quant_t.get("cer"),
+                "baseline_wer": baseline_wer,
+                "baseline_cer": baseline_cer,
+                "quant_wer": quant_wer,
+                "quant_cer": quant_cer,
+                "wer_delta_vs_baseline": (
+                    quant_wer - baseline_wer if baseline_wer is not None and quant_wer is not None else None
+                ),
+                "cer_delta_vs_baseline": (
+                    quant_cer - baseline_cer if baseline_cer is not None and quant_cer is not None else None
+                ),
                 "mcd": acoustics.get("mcd"),
                 "f0_frame_error": acoustics.get("f0_frame_error"),
                 "pitch_pearson_correlation": acoustics.get("pitch_pearson_correlation"),
@@ -237,6 +291,7 @@ def _logprobs_kl_rows(
                 {
                     "model": model,
                     "quant_type": quant_type,
+                    **_run_labels(quant_type),
                     "sample_id": sample_id,
                     "ground_truth_text": text,
                     "step": step,
@@ -270,6 +325,7 @@ def _codec_rows(model: str, quant_type: str, codebook_per_sample: list[dict[str,
                 {
                     "model": model,
                     "quant_type": quant_type,
+                    **_run_labels(quant_type),
                     "sample_id": entry.get("sample_id"),
                     "ground_truth_text": entry.get("text"),
                     "codec_family": entry.get("codec_family"),
@@ -308,6 +364,9 @@ def _write_workbook(
         if not summary_long.empty
         else pd.DataFrame()
     )
+    per_sample = _move_columns_after(per_sample, "quant_type", _RUN_LABEL_COLS)
+    logprobs_kl = _move_columns_after(logprobs_kl, "quant_type", _RUN_LABEL_COLS)
+    codec = _move_columns_after(codec, "quant_type", _RUN_LABEL_COLS)
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
@@ -344,6 +403,17 @@ def update_report(
     codebook_summary = codebook_divergence.get("summary", {})
     codebook_per_sample = codebook_divergence.get("per_sample", [])
     ftdr = compute_first_token_divergence_rate(dist_per_sample)
+    first_tf_mismatch_positions = _first_teacher_forced_mismatch_positions(dist_per_sample)
+    finite_first_tf_positions = [pos for pos in first_tf_mismatch_positions if pos is not None]
+    if dist_summary:
+        dist_summary = dict(dist_summary)
+        dist_summary["num_samples_with_first_token_divergence"] = sum(
+            1 for pos in first_tf_mismatch_positions if pos == 0
+        )
+        dist_summary["num_samples_with_any_teacher_forced_argmax_mismatch"] = len(finite_first_tf_positions)
+        dist_summary["mean_first_teacher_forced_mismatch_position"] = (
+            sum(finite_first_tf_positions) / len(finite_first_tf_positions) if finite_first_tf_positions else math.nan
+        )
     teacher_forced_hierarchy = teacher_forced_hierarchy_divergence(
         dist_per_sample, model_name=model, tokens_per_frame=dist_summary.get("tokens_per_frame"),
     )
@@ -420,12 +490,19 @@ def update_transcription_report(
     for offset, row_index in enumerate(row_indices):
         baseline_t = baseline_samples[offset] if offset < len(baseline_samples) else {}
         quant_t = quant_samples[offset] if offset < len(quant_samples) else {}
+        labels = _run_labels(quant_type)
+        for column, value in labels.items():
+            per_sample.loc[row_index, column] = value
         per_sample.loc[row_index, "baseline_transcript"] = baseline_t.get("transcript")
         per_sample.loc[row_index, "baseline_wer"] = baseline_t.get("wer")
         per_sample.loc[row_index, "baseline_cer"] = baseline_t.get("cer")
         per_sample.loc[row_index, "quant_transcript"] = quant_t.get("transcript")
         per_sample.loc[row_index, "quant_wer"] = quant_t.get("wer")
         per_sample.loc[row_index, "quant_cer"] = quant_t.get("cer")
+        if baseline_t.get("wer") is not None and quant_t.get("wer") is not None:
+            per_sample.loc[row_index, "wer_delta_vs_baseline"] = quant_t.get("wer") - baseline_t.get("wer")
+        if baseline_t.get("cer") is not None and quant_t.get("cer") is not None:
+            per_sample.loc[row_index, "cer_delta_vs_baseline"] = quant_t.get("cer") - baseline_t.get("cer")
 
     _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
 

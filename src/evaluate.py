@@ -246,7 +246,10 @@ def run_model(model, prompts: list[str], args: argparse.Namespace, run_dir: Path
         random.seed(sample_seed)
         np.random.seed(sample_seed)
         torch.manual_seed(sample_seed)
-        torch.xpu.manual_seed_all(sample_seed)
+        if args.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+        elif args.device.startswith("xpu") and hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(sample_seed)
         set_seed(sample_seed)
 
         synchronize(args.device)
