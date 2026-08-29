@@ -2,7 +2,7 @@
 
 Speech-Quant studies how post-training quantization changes autoregressive text-to-speech models that generate discrete neural-codec tokens. The main question is simple: when we compress the language-model backbone, where does speech quality start to fail, and which metrics reveal the failure earliest?
 
-This codebase compares full-precision baselines against several quantized variants across neural-codec TTS models such as Orpheus, NeuTTS, OuteTTS, and Qwen3-TTS. It is intended to support research experiments and paper figures, not to serve as a production TTS toolkit.
+This codebase compares full-precision baselines against quantized variants of Orpheus, NeuTTS, and OuteTTS. It is intended to support research experiments and paper figures, not to serve as a production TTS toolkit.
 
 ## Why This Study
 
@@ -32,7 +32,6 @@ Recommended environments:
 | `.venv-orpheus` | `orpheus` | Orpheus / SNAC |
 | `.venv-neutts` | `neutts` | NeuTTS / NeuCodec |
 | `.venv-outetts` | `outetts` | OuteTTS / DAC |
-| `.venv-qwen` | `qwen-tts` | Qwen3-TTS |
 | `.venv-asr` | `asr` | Cohere ASR (WER/CER pass, no TTS deps) |
 
 Create another environment by changing both names:
@@ -57,15 +56,6 @@ Run one of the model scripts after activating the matching environment:
 source .venv-orpheus/bin/activate
 bash scripts/run_orpheus.sh
 ```
-
-Qwen uses its CustomVoice checkpoint and the adapter's built-in default voice:
-
-```bash
-./scripts/run_qwen.sh
-```
-
-This runs the full-precision Qwen baseline. Qwen quantized variants are not yet
-supported by the shared quantization pipeline.
 
 The scripts compare one full-precision baseline against the configured quantization methods:
 
@@ -105,7 +95,7 @@ Only SmoothQuant (`sq-*`) quantizes activations to 8-bit. RTN, GPTQ, and AWQ are
 
 Each `scripts/run_*.sh` calls this pass automatically once generation finishes, via `scripts/transcribe.sh`. If `.venv-asr` does not exist the step is skipped with a warning instead of failing the run.
 
-It uses its own environment (`.venv-asr`) because Cohere ASR needs `transformers>=5.15`, which conflicts with the `qwen-tts` pin.
+It uses its own environment (`.venv-asr`) so transcription dependencies remain separate from TTS generation environments.
 
 To run it on its own, for every model and quantization folder found:
 

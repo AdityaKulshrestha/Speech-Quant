@@ -26,9 +26,9 @@ class CodecSpec:
 def detect_codec_family(model_name: str | None) -> str:
     """Infer whether the model uses RVQ or FSQ-style tokenization."""
     name = (model_name or "").lower()
-    if any(token in name for token in ("orpheus", "snac", "higgs", "outetts", "dac", "rvq")):
+    if any(token in name for token in ("orpheus", "snac", "outetts", "dac", "rvq")):
         return "rvq"
-    if any(token in name for token in ("neutts", "fsq", "neucodec", "llasa", "xcodec2")):
+    if any(token in name for token in ("neutts", "fsq", "neucodec")):
         return "fsq"
     return "rvq"
 
@@ -40,10 +40,9 @@ def get_codec_spec(
 ) -> CodecSpec:
     """Return the hierarchy metadata used to bucket mismatch severity by token level.
 
-    tokens_per_frame overrides the family default (Orpheus/SNAC: 7). Higgs Audio uses
-    a variable number of code groups per frame, so any frame size other than the
-    Orpheus 7-token layout falls back to a generic coarse (position 0) vs. fine
-    (remaining positions) split instead of the fixed coarse/medium/fine table.
+    tokens_per_frame overrides the family default (Orpheus/SNAC: 7). Any frame
+    size other than the Orpheus 7-token layout falls back to a generic coarse
+    (position 0) vs. fine (remaining positions) split.
     """
     codec_family = (family or detect_codec_family(model_name) or "rvq").lower()
     if codec_family == "rvq":

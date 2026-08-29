@@ -23,8 +23,7 @@ def codebook_ids_for_tokens(
     """Codebook index for each flat token position, generic across codec families.
 
     Orpheus/SNAC (tokens_per_frame=7) keeps its coarse/medium/fine layout by
-    default. Any other frame size (e.g. Higgs Audio's 8-codebook frames,
-    or 1 for flat FSQ codecs) falls back to the identity layout: slot t%tpf
+    default. Any other frame size falls back to the identity layout: slot t%tpf
     maps to codebook id t%tpf.
     """
     if frame_layout is None:

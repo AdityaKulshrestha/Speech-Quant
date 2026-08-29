@@ -8,7 +8,7 @@ DAC codebook streams as ordinary vocabulary tokens: `<|c1_0..1024|>` then
 contiguous 2050-token vocab block with c1 immediately followed by c2 — the
 same "single shared vocab slice, N tokens per frame" layout Orpheus/SNAC
 uses, so this model gets full teacher-forced distribution comparison
-support (unlike HiggsAudioV3Model).
+support.
 
 This intentionally does NOT depend on the `outetts` PyPI package: that
 package hard-pins transformers==4.52.3 plus a large stack of unrelated
@@ -84,7 +84,7 @@ class OuteTTSModel(BaseTTS):
 
     AUDIO_TOKEN_START = 0: audio_tokens are de-offset relative to the shared
     c1+c2 vocab block (VOCAB_AUDIO_TOKEN_START holds the real vocab offset),
-    same convention as NeuTTS/Llasa. TOKENS_PER_FRAME=2 (c1, c2 interleaved
+    same convention as NeuTTS. TOKENS_PER_FRAME=2 (c1, c2 interleaved
     per DAC frame), CODEBOOK_SIZE=1025 per codebook.
     """
 

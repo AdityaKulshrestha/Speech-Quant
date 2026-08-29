@@ -55,19 +55,6 @@ neutts = [
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
-# Higgs Audio v3: Qwen3-4B backbone + fused multi-codebook audio head/embedding,
-# with the higgs_audio_v2_tokenizer codec (both loaded via trust_remote_code).
-# Shares base's transformers>=5.15 stack -- no separate torch/transformers pin needed.
-higgs = [
-    {include-group = "base"},
-    "numpy>=1.26",
-    "transformers>=5.15.0",
-    "datasets>=4.8.4,<=4.8.5",
-    "huggingface-hub>=1.5.0",
-    "pyarrow>=21.0.0",
-    "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
-]
-
 # OuteTTS: with Descript Audio Codec
 outetts = [
     {include-group = "base"},
@@ -100,23 +87,6 @@ asr = [
     "nemo_text_processing>=1.0",
 ]
 
-# LLASA: Temporarily disabled due to incompatible torch version (2.4.1 vs 2.11.0)
-# TODO: Re-enable after resolving torch version conflicts
-# llasa = [
-#     "torch==2.4.1",
-#     "torchaudio==2.4.1",
-#     "accelerate>=0.30",
-#     "soundfile>=0.12",
-#     "numpy==2.0.2",
-#     "matplotlib>=3.7",
-#     "pandas>=2.0",
-#     "openpyxl>=3.1",
-#     "nemo_text_processing>=1.0",
-#     "transformers==4.45.2",
-#     "xcodec2==0.1.3",
-#     "gptqmodel>=1.0.0",
-# ]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -144,6 +114,6 @@ conflicts = [
     [{ group = "neutts" }, { group = "outetts" }],
     [{ group = "neutts" }, { group = "asr" }],
     [{ group = "outetts" }, { group = "asr" }],
-    # base is included by orpheus/neutts/outetts/higgs, but not by the standalone asr group.
+    # base is included by the TTS groups, but not by the standalone asr group.
     [{ group = "base" }, { group = "asr" }],
 ]

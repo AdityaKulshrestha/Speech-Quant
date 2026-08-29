@@ -4,7 +4,7 @@
 
 set -e
 
-MODELS="orpheus neutts higgs outetts asr"
+MODELS="orpheus neutts outetts asr"
 
 show_help() {
     cat << EOF
@@ -15,7 +15,6 @@ Create and sync a uv environment for a specific model.
 Available models:
   orpheus   - Orpheus (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   neutts    - NeuTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
-  higgs     - Higgs Audio v3 (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   outetts   - OuteTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   asr       - Cohere ASR WER/CER pass only (group "asr", no TTS deps)
   all       - Create all model environments
@@ -146,7 +145,7 @@ case "${MODEL}" in
         done
         echo ""
         ;;
-    orpheus|neutts|higgs|outetts|asr)
+    orpheus|neutts|outetts|asr)
         setup_model "${MODEL}" "${REINSTALL}"
         ;;
     *)

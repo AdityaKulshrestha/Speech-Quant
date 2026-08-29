@@ -4,7 +4,7 @@ Mel-Cepstral Distortion (MCD), F0 Frame Error / Pitch Pearson Correlation, and
 UTMOS between baseline and quantized waveforms for the same prompt.
 
 MCD/F0 operate on raw audio rather than codec tokens, so they are naturally
-codec-agnostic and apply the same way to Orpheus, NeuTTS, and Higgs Audio.
+codec-agnostic and apply the same way to Orpheus, NeuTTS, and OuteTTS.
 
 Phase 1's remaining metric (NISQA, SECS) is intentionally not implemented
 here; see METRICS.md.
@@ -141,14 +141,11 @@ def utmos_score(audio_path: str | Path) -> float | None:
                 "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
             )
 
-        # Load audio at 16kHz (UTMOS requirement)
-        audio, sr = torchaudio.load(str(audio_path))
-        if sr != 16000:
-            audio = torchaudio.functional.resample(audio, sr, 16000)
+        # Load audio at 16kHz (UTMOS requirement) using soundfile instead of torchaudio
+        audio_np, sr = _load_audio(audio_path, target_sr=16000)
 
-        # Convert to mono if stereo
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0, keepdim=True)
+        # Convert numpy array to torch tensor [1, samples] for UTMOS model
+        audio = torch.from_numpy(audio_np).unsqueeze(0)
 
         score = _utmos_predictor(audio, sr=16000)
         return float(score)
