@@ -39,6 +39,16 @@ Replace `orpheus` with `neutts` or `outetts` as needed. Add `--reinstall` to
 recreate an existing environment. Use `./setup-env.sh all` to prepare every
 TTS and ASR environment.
 
+### Why Multiple Environments
+
+The supported models cannot safely share one environment. Orpheus installs
+GPTQModel, which requires a newer `torchao`; NeuTTS pins `torchao==0.13.0` for
+NeuCodec; and OuteTTS brings DAC dependencies with a different protobuf
+constraint. The separate environments keep each model's codec and
+quantization stack reproducible instead of resolving one model by breaking
+another. The ASR environment is also isolated because it is used only after
+audio generation for WER and CER scoring.
+
 | environment | group | model / codec |
 |---|---|---|
 | `.venv-orpheus` | `orpheus` | Orpheus / SNAC |
