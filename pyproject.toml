@@ -15,8 +15,6 @@ base = [
     "accelerate>=0.30",
     "soundfile>=0.12",
     "librosa>=0.10.0",  # acoustic metrics (MCD, F0)
-    # UTMOS (perceptual quality) loads tarepan/SpeechMOS via torch.hub, not pip
-    # numpy version specified per-model due to llmcompressor/neucodec conflicts
     "matplotlib>=3.7",
     "pandas>=2.0",
     "openpyxl>=3.1",  # consolidated analysis_report.xlsx
@@ -57,26 +55,17 @@ neutts = [
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
-# Qwen TTS: uses llmcompressor 0.9.x (requires torch<=2.9.1, transformers 4.57.3, numpy>=2.0)
-# Standalone group with different torch version
-qwen-tts = [
-    "torch==2.9.1",
-    "torchaudio==2.9.1",
-    "accelerate>=0.30",
-    "soundfile>=0.12",
-    "numpy>=2.0.0,<=2.3.5",  # llmcompressor 0.9.x requirement
-    "librosa>=0.10.0",  # acoustic metrics (MCD, F0)
-    # UTMOS (perceptual quality) loads tarepan/SpeechMOS via torch.hub, not pip
-    "matplotlib>=3.7",
-    "pandas>=2.0",
-    "openpyxl>=3.1",
-    "nemo_text_processing>=1.0",
-    "transformers==4.57.3",
-    "datasets>=4.0.0,<=4.4.1",  # llmcompressor 0.9.x requirement
-    "huggingface-hub>=0.36.0,<1.0.0",
-    "pyarrow<21",
-    "qwen_tts @ git+https://github.com/QwenLM/Qwen3-TTS",
-    "llmcompressor>=0.9.0,<0.10.0",
+# Higgs Audio v3: Qwen3-4B backbone + fused multi-codebook audio head/embedding,
+# with the higgs_audio_v2_tokenizer codec (both loaded via trust_remote_code).
+# Shares base's transformers>=5.15 stack -- no separate torch/transformers pin needed.
+higgs = [
+    {include-group = "base"},
+    "numpy>=1.26",
+    "transformers>=5.15.0",
+    "datasets>=4.8.4,<=4.8.5",
+    "huggingface-hub>=1.5.0",
+    "pyarrow>=21.0.0",
+    "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
 # OuteTTS: with Descript Audio Codec
@@ -144,22 +133,17 @@ default-groups = []  # Don't automatically include any groups
 environments = ["sys_platform == 'linux' and python_version == '3.12'"]
 conflicts = [
     # Every group below is installed into its own venv (.venv-<name>), and they are
-    # pairwise unsatisfiable together: qwen-tts pins torch 2.9.1 / transformers 4.57.3,
-    # neutts pins torchao==0.13 for neucodec, outetts pulls descript-audio-codec
-    # (protobuf<3.20), orpheus pulls gptqmodel>=7 (torchao>=0.16, protobuf>=7.34),
-    # and asr needs transformers>=5.15 with protobuf>=4.25. Declaring the pairs keeps
-    # `uv lock` from trying to satisfy all of them in one resolution.
+    # pairwise unsatisfiable together: neutts pins torchao==0.13 for neucodec,
+    # outetts pulls descript-audio-codec (protobuf<3.20), orpheus pulls
+    # gptqmodel>=7 (torchao>=0.16, protobuf>=7.34), and asr needs transformers>=5.15
+    # with protobuf>=4.25. Declaring the pairs keeps `uv lock` from trying to
+    # satisfy all of them in one resolution.
     [{ group = "orpheus" }, { group = "neutts" }],
     [{ group = "orpheus" }, { group = "outetts" }],
-    [{ group = "orpheus" }, { group = "qwen-tts" }],
     [{ group = "orpheus" }, { group = "asr" }],
     [{ group = "neutts" }, { group = "outetts" }],
-    [{ group = "neutts" }, { group = "qwen-tts" }],
     [{ group = "neutts" }, { group = "asr" }],
-    [{ group = "outetts" }, { group = "qwen-tts" }],
     [{ group = "outetts" }, { group = "asr" }],
-    [{ group = "qwen-tts" }, { group = "asr" }],
-    # base is included by orpheus/neutts/outetts, but not by the standalone groups.
-    [{ group = "base" }, { group = "qwen-tts" }],
+    # base is included by orpheus/neutts/outetts/higgs, but not by the standalone asr group.
     [{ group = "base" }, { group = "asr" }],
 ]

@@ -8,7 +8,7 @@ DAC codebook streams as ordinary vocabulary tokens: `<|c1_0..1024|>` then
 contiguous 2050-token vocab block with c1 immediately followed by c2 — the
 same "single shared vocab slice, N tokens per frame" layout Orpheus/SNAC
 uses, so this model gets full teacher-forced distribution comparison
-support (unlike QwenTTSModel).
+support (unlike HiggsAudioV3Model).
 
 This intentionally does NOT depend on the `outetts` PyPI package: that
 package hard-pins transformers==4.52.3 plus a large stack of unrelated

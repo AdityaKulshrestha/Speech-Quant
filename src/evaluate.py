@@ -51,7 +51,7 @@ REPO_ROOT = SRC_DIR.parent
 MODEL_REGISTRY = {
     "orpheus": ("models.orpheus_model", "OrpheusTTS"),
     "neutts": ("models.neutts_model", "NeuTTSModel"),
-    "qwen": ("models.qwentts_model", "QwenTTSModel"),
+    "higgs": ("models.higgs_model", "HiggsAudioV3Model"),
     "outetts": ("models.outetts_model", "OuteTTSModel"),
     "llasa": ("models.llasa_model", "LlasaModel"),
 }
@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         default="tara",
         help=(
             "Speaker/voice tag (Orpheus: voice style; NeuTTS: emily/paul/sophie/steven; "
-            "OuteTTS/Llasa/Qwen: unused, zero-shot or model-default voice)."
+            "OuteTTS/Llasa/Higgs: unused, zero-shot or model-default voice)."
         ),
     )
     parser.add_argument(

@@ -4,7 +4,7 @@ Mel-Cepstral Distortion (MCD), F0 Frame Error / Pitch Pearson Correlation, and
 UTMOS between baseline and quantized waveforms for the same prompt.
 
 MCD/F0 operate on raw audio rather than codec tokens, so they are naturally
-codec-agnostic and apply the same way to Orpheus, NeuTTS, and Qwen TTS.
+codec-agnostic and apply the same way to Orpheus, NeuTTS, and Higgs Audio.
 
 Phase 1's remaining metric (NISQA, SECS) is intentionally not implemented
 here; see METRICS.md.

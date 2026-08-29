@@ -9,9 +9,9 @@ vector-quantizer codec (not RVQ despite the multi-codebook naming elsewhere):
 
 Requires the `xcodec2` package, which hard-pins torch==2.5.0/torchaudio==2.5.0
 transitively via `torchtune`. Run this model from a dedicated `.venv-llasa`
-environment (same recipe as `.venv-qwen` — link the main `.venv`'s
-site-packages via a `.pth` file, then install `xcodec2` with `--no-deps` so
-it doesn't drag in a conflicting torch build):
+environment (link the main `.venv`'s site-packages via a `.pth` file, then
+install `xcodec2` with `--no-deps` so it doesn't drag in a conflicting torch
+build):
     uv venv .venv-llasa --python 3.12.13
     echo "<repo>/.venv/lib/python3.12/site-packages" > \\
         .venv-llasa/lib/python3.12/site-packages/_main_venv_link.pth

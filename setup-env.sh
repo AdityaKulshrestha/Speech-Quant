@@ -4,7 +4,7 @@
 
 set -e
 
-MODELS="orpheus neutts qwen outetts asr"
+MODELS="orpheus neutts higgs outetts asr"
 
 show_help() {
     cat << EOF
@@ -15,7 +15,7 @@ Create and sync a uv environment for a specific model.
 Available models:
   orpheus   - Orpheus (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   neutts    - NeuTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
-  qwen      - Qwen TTS (transformers 4.57.3, llmcompressor 0.9.x, torch 2.9.1)
+  higgs     - Higgs Audio v3 (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   outetts   - OuteTTS (transformers 5.15+, llmcompressor dev, torch 2.11.0)
   asr       - Cohere ASR WER/CER pass only (group "asr", no TTS deps)
   all       - Create all model environments
@@ -79,11 +79,6 @@ setup_model() {
         setup_asr "${reinstall}"
         return
     fi
-
-    # Map model names to group names
-    case "${model}" in
-        qwen) group="qwen-tts" ;;
-    esac
 
     echo "======================================"
     echo "Setting up: ${model}"
@@ -151,12 +146,8 @@ case "${MODEL}" in
         done
         echo ""
         ;;
-    orpheus|neutts|qwen|outetts|asr)
+    orpheus|neutts|higgs|outetts|asr)
         setup_model "${MODEL}" "${REINSTALL}"
-        ;;
-    qwen-tts)
-        # Accept both qwen and qwen-tts
-        setup_model "qwen" "${REINSTALL}"
         ;;
     *)
         echo "Error: Unknown model '${MODEL}'"
