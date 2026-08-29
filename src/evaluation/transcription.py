@@ -85,9 +85,10 @@ def levenshtein_distance(ref: Sequence[str], hyp: Sequence[str]) -> int:
     return dp[-1][-1]
 
 
-def word_error_rate(reference: str, hypothesis: str) -> float:
-    ref_tokens = normalize_text(reference).split()
-    hyp_tokens = normalize_text(hypothesis).split()
+def word_error_rate_normalized(normalized_reference: str, normalized_hypothesis: str) -> float:
+    """WER between two already-normalized strings (skips re-running NeMo normalization)."""
+    ref_tokens = normalized_reference.split()
+    hyp_tokens = normalized_hypothesis.split()
     if not ref_tokens and not hyp_tokens:
         return 0.0
     distance = levenshtein_distance(ref_tokens, hyp_tokens)
@@ -95,14 +96,23 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return distance / denom
 
 
-def character_error_rate(reference: str, hypothesis: str) -> float:
-    ref_chars = list(normalize_text(reference))
-    hyp_chars = list(normalize_text(hypothesis))
+def character_error_rate_normalized(normalized_reference: str, normalized_hypothesis: str) -> float:
+    """CER between two already-normalized strings (skips re-running NeMo normalization)."""
+    ref_chars = list(normalized_reference)
+    hyp_chars = list(normalized_hypothesis)
     if not ref_chars and not hyp_chars:
         return 0.0
     distance = levenshtein_distance(ref_chars, hyp_chars)
     denom = max(len(ref_chars), 1)
     return distance / denom
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    return word_error_rate_normalized(normalize_text(reference), normalize_text(hypothesis))
+
+
+def character_error_rate(reference: str, hypothesis: str) -> float:
+    return character_error_rate_normalized(normalize_text(reference), normalize_text(hypothesis))
 
 
 def load_prompts(path: Path) -> list[str]:
@@ -243,11 +253,22 @@ def evaluate_transcription_run(
     wer_values = []
     cer_values = []
     for prompt, transcript in zip(prompts[:n_allowed], transcripts):
-        wer = word_error_rate(prompt, transcript)
-        cer = character_error_rate(prompt, transcript)
+        norm_prompt = normalize_text(prompt)
+        norm_transcript = normalize_text(transcript)
+        wer = word_error_rate_normalized(norm_prompt, norm_transcript)
+        cer = character_error_rate_normalized(norm_prompt, norm_transcript)
         wer_values.append(wer)
         cer_values.append(cer)
-        entries.append({"prompt": prompt, "transcript": transcript, "wer": wer, "cer": cer})
+        entries.append(
+            {
+                "prompt": prompt,
+                "transcript": transcript,
+                "prompt_normalized": norm_prompt,
+                "transcript_normalized": norm_transcript,
+                "wer": wer,
+                "cer": cer,
+            }
+        )
 
     return {
         "run": run_dir.name,
@@ -298,14 +319,18 @@ def evaluate_quant_dir(
     cer_values = []
 
     for prompt, transcript in zip(prompts, transcripts):
-        wer = word_error_rate(prompt, transcript)
-        cer = character_error_rate(prompt, transcript)
+        norm_prompt = normalize_text(prompt)
+        norm_transcript = normalize_text(transcript)
+        wer = word_error_rate_normalized(norm_prompt, norm_transcript)
+        cer = character_error_rate_normalized(norm_prompt, norm_transcript)
         wer_values.append(wer)
         cer_values.append(cer)
         score_rows.append(
             {
                 "prompt": prompt,
                 "transcript": transcript,
+                "prompt_normalized": norm_prompt,
+                "transcript_normalized": norm_transcript,
                 "wer": wer,
                 "cer": cer,
             }

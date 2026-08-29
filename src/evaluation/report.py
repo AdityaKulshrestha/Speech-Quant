@@ -63,7 +63,7 @@ _RUN_LABEL_COLS = ["comparison", "baseline_run", "quant_run"]
 
 # Columns that identify a row in the wide layout; everything else becomes a
 # per-quant_type column group.
-_PER_SAMPLE_ID_COLS = ["model", "sample_id", "ground_truth_text"]
+_PER_SAMPLE_ID_COLS = ["model", "sample_id", "ground_truth_text", "ground_truth_normalized"]
 _LOGPROBS_ID_COLS = ["model", "sample_id", "ground_truth_text", "step", "codebook_id"]
 _CODEC_ID_COLS = [
     "model",
@@ -266,6 +266,9 @@ def _per_sample_rows(
                 "ground_truth_text": score.get("text"),
                 "baseline_transcript": baseline_t.get("transcript"),
                 "quant_transcript": quant_t.get("transcript"),
+                "ground_truth_normalized": baseline_t.get("prompt_normalized"),
+                "baseline_transcript_normalized": baseline_t.get("transcript_normalized"),
+                "quant_transcript_normalized": quant_t.get("transcript_normalized"),
                 "baseline_wer": baseline_wer,
                 "baseline_cer": baseline_cer,
                 "quant_wer": quant_wer,
@@ -586,6 +589,9 @@ def update_transcription_report(
             **_run_labels(quant_type),
             "baseline_transcript": column(baseline_samples, "transcript"),
             "quant_transcript": column(quant_samples, "transcript"),
+            "ground_truth_normalized": column(baseline_samples, "prompt_normalized"),
+            "baseline_transcript_normalized": column(baseline_samples, "transcript_normalized"),
+            "quant_transcript_normalized": column(quant_samples, "transcript_normalized"),
             "baseline_wer": baseline_wer,
             "baseline_cer": baseline_cer,
             "quant_wer": quant_wer,

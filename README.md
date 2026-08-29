@@ -162,13 +162,6 @@ Speech-Quant records metrics at three levels:
 
 The teacher-forced metrics are the cleanest way to compare model distributions because the baseline and quantized model are evaluated on the same prefix at each step. The free-run metrics remain useful for measuring how divergence appears in actual sampled generation.
 
-**For comprehensive metric documentation, interpretation guidelines, and analysis results, see [`METRICS.md`](METRICS.md)**, which includes:
-- Detailed calculation methods and code locations for each metric
-- Range, interpretation, and "what to listen for" guidelines
-- Analysis results from 800 evaluation runs (2 models × 8 quantization methods × 50 prompts)
-- Quantization algorithm rankings and recommendations
-- Efficiency analysis (compression vs quality trade-offs)
-
 ## License
 
 This project is released under the MIT License. See `LICENSE` for details.

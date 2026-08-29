@@ -19,8 +19,6 @@ base = [
     # numpy version specified per-model due to llmcompressor/neucodec conflicts
     "matplotlib>=3.7",
     "pandas>=2.0",
-    "gptqmode>=7.0.0",
-    "optimum==2.2.0",
     "openpyxl>=3.1",  # consolidated analysis_report.xlsx
     "nemo_text_processing>=1.0",  # WER/CER text normalization
 ]
@@ -38,6 +36,9 @@ orpheus = [
     "huggingface-hub>=1.5.0",
     "pyarrow>=21.0.0",
     "snac>=1.2.1",
+    # Not in `base`: gptqmodel>=7 requires torchao>=0.16, which neutts cannot take.
+    "gptqmodel>=7.0.0",
+    "optimum==2.2.0",
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
@@ -142,22 +143,23 @@ package = false
 default-groups = []  # Don't automatically include any groups
 environments = ["sys_platform == 'linux' and python_version == '3.12'"]
 conflicts = [
-    # qwen-tts (torch 2.9.1, transformers 4.57.3) vs others (torch 2.11.0, transformers 5.15+)
-    [
-        { group = "qwen-tts" },
-        { group = "orpheus" },
-    ],
-    [
-        { group = "qwen-tts" },
-        { group = "neutts" },
-    ],
-    [
-        { group = "qwen-tts" },
-        { group = "outetts" },
-    ],
-    # base conflicts with qwen-tts
-    [
-        { group = "base" },
-        { group = "qwen-tts" },
-    ],
+    # Every group below is installed into its own venv (.venv-<name>), and they are
+    # pairwise unsatisfiable together: qwen-tts pins torch 2.9.1 / transformers 4.57.3,
+    # neutts pins torchao==0.13 for neucodec, outetts pulls descript-audio-codec
+    # (protobuf<3.20), orpheus pulls gptqmodel>=7 (torchao>=0.16, protobuf>=7.34),
+    # and asr needs transformers>=5.15 with protobuf>=4.25. Declaring the pairs keeps
+    # `uv lock` from trying to satisfy all of them in one resolution.
+    [{ group = "orpheus" }, { group = "neutts" }],
+    [{ group = "orpheus" }, { group = "outetts" }],
+    [{ group = "orpheus" }, { group = "qwen-tts" }],
+    [{ group = "orpheus" }, { group = "asr" }],
+    [{ group = "neutts" }, { group = "outetts" }],
+    [{ group = "neutts" }, { group = "qwen-tts" }],
+    [{ group = "neutts" }, { group = "asr" }],
+    [{ group = "outetts" }, { group = "qwen-tts" }],
+    [{ group = "outetts" }, { group = "asr" }],
+    [{ group = "qwen-tts" }, { group = "asr" }],
+    # base is included by orpheus/neutts/outetts, but not by the standalone groups.
+    [{ group = "base" }, { group = "qwen-tts" }],
+    [{ group = "base" }, { group = "asr" }],
 ]
