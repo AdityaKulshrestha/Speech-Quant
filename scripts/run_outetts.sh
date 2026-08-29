@@ -3,6 +3,12 @@
 # rtn/gptq/awq/sq quant flavour at 4bit and 8bit, then compares them (FDP / D(t) / KL / prob-diff).
 set -euo pipefail
 
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <device>" >&2
+    exit 1
+fi
+
+DEVICE="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
@@ -20,7 +26,7 @@ python "$REPO_ROOT/src/evaluate.py" \
     --prompts-file "$REPO_ROOT/src/prompts.txt" \
     --num-samples 50 \
     --output-dir "$REPO_ROOT/outputs" \
-    --device xpu \
+    --device "$DEVICE" \
     --max-new-tokens 1200 \
     --temperature 0.4 \
     --top-p 0.9 \

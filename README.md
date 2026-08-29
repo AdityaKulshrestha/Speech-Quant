@@ -26,6 +26,19 @@ dependencies conflict.
 Set `DEVICE` when creating an environment to choose its PyTorch backend. The
 default is `auto`.
 
+### Gated Model Access
+
+Some model checkpoints require approved access on Hugging Face. Request access
+and accept the model's terms on its model page, then export a read token before
+running setup or evaluation:
+
+```bash
+export HF_TOKEN="your_hugging_face_read_token"
+```
+
+The token stays in the current shell session. Do not commit it to the
+repository or include it in scripts.
+
 ### Create An Environment
 
 From the repository root, create one environment for the model you intend to
@@ -64,14 +77,17 @@ comparison artifacts, and then starts transcription when `.venv-asr` exists.
 
 ```bash
 source .venv-orpheus/bin/activate
-bash scripts/run_orpheus.sh
+bash scripts/run_orpheus.sh <device>
 
 source .venv-neutts/bin/activate
-bash scripts/run_neutts.sh
+bash scripts/run_neutts.sh <device>
 
 source .venv-outetts/bin/activate
-bash scripts/run_outetts.sh
+bash scripts/run_outetts.sh <device>
 ```
+
+Pass the device supported by the active PyTorch environment, such as `cpu`,
+`cuda`, or `xpu`.
 
 The launchers use the following quantization variants:
 
