@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
-# Helper script to create and sync model-specific environments
-# Uses UV_PROJECT_ENVIRONMENT to create separate venvs per model
+# Helper script to create model-specific environments and install dependencies.
 
 set -e
 
 MODELS="orpheus neutts outetts asr"
+DEVICE="${DEVICE:-auto}"
+
+case "${DEVICE}" in
+    auto|cpu|xpu)
+        TORCH_BACKEND="${DEVICE}"
+        ;;
+    cuda)
+        TORCH_BACKEND="auto"
+        ;;
+    *)
+        echo "Error: DEVICE must be auto, cpu, cuda, or xpu (got '${DEVICE}')."
+        exit 1
+        ;;
+esac
 
 show_help() {
     cat << EOF
 Usage: ./setup-env.sh [MODEL] [--reinstall]
 
-Create and sync a uv environment for a specific model.
+Create a uv environment and install dependencies for a specific model.
+Set DEVICE=cpu, DEVICE=cuda, or DEVICE=xpu to select the PyTorch backend.
 
 Available models:
   orpheus   - Orpheus (transformers 5.15+, llmcompressor dev, torch 2.11.0)
@@ -23,9 +37,9 @@ Flags:
   --reinstall    Delete existing environment before creating
 
 Examples:
-  ./setup-env.sh orpheus              # Create/sync .venv-orpheus
-  ./setup-env.sh orpheus --reinstall  # Recreate .venv-orpheus from scratch
-  ./setup-env.sh all                  # Create all environments
+    DEVICE=xpu ./setup-env.sh orpheus              # Create/sync .venv-orpheus
+    DEVICE=cpu ./setup-env.sh orpheus --reinstall  # Recreate on CPU
+    DEVICE=cuda ./setup-env.sh all                 # Create all environments
 
 Note: Requires --index-strategy unsafe-best-match for package resolution.
 
@@ -57,6 +71,7 @@ setup_asr() {
     echo "Installing dependencies..."
     uv pip install --python "${venv_name}" \
         --index-strategy unsafe-best-match \
+        --torch-backend "${TORCH_BACKEND}" \
         --group asr
 
     echo ""
@@ -99,9 +114,11 @@ setup_model() {
         uv venv "${venv_name}" --python 3.12
     fi
 
-    # Sync dependencies using UV_PROJECT_ENVIRONMENT
-    echo "Syncing dependencies..."
-    UV_PROJECT_ENVIRONMENT="${venv_name}" uv sync --group "${group}" --index-strategy unsafe-best-match
+    echo "Installing dependencies for ${DEVICE}..."
+    uv pip install --python "${venv_name}" \
+        --index-strategy unsafe-best-match \
+        --torch-backend "${TORCH_BACKEND}" \
+        --group "${group}"
 
     echo ""
     echo "✓ Environment ready: ${venv_name}"

@@ -21,12 +21,10 @@ dependencies conflict.
 - Linux
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
-- An Intel XPU runtime compatible with the pinned `torch==2.11.0+xpu` and
-	`torchaudio==2.11.0+xpu` packages
 - Network access for Hugging Face model and dataset downloads on the first run
 
-The project currently pins the XPU PyTorch index in `pyproject.toml`. It does
-not yet provide a CUDA, CPU, or other-accelerator dependency profile.
+Set `DEVICE` when creating an environment to choose its PyTorch backend. The
+default is `auto`.
 
 ### Create An Environment
 
@@ -40,16 +38,6 @@ run:
 Replace `orpheus` with `neutts` or `outetts` as needed. Add `--reinstall` to
 recreate an existing environment. Use `./setup-env.sh all` to prepare every
 TTS and ASR environment.
-
-Verify that the selected environment has the required packages and can see the
-XPU before downloading a model:
-
-```bash
-source .venv-orpheus/bin/activate
-python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
-```
-
-The final line must print `True` before running an experiment.
 
 | environment | group | model / codec |
 |---|---|---|
@@ -81,27 +69,6 @@ The launchers use the following quantization variants:
 rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit
 ```
 
-### Fast Validation Run
-
-Before launching the full 50-prompt sweep, verify one model with a single
-baseline prompt. This checks model download, XPU execution, codec decoding, and
-audio output without quantization:
-
-```bash
-python src/evaluate.py \
-	--model orpheus \
-	--model-name canopylabs/orpheus-3b-0.1-ft \
-	--quant-type none \
-	--prompts-file src/prompts.txt \
-	--num-samples 1 \
-	--output-dir outputs \
-	--seed 0
-```
-
-For a quantization smoke test, change `--quant-type` to `rtn-8bit` and keep
-`--num-samples 1`. The first quantized run downloads calibration data and saves
-a compressed checkpoint under `quant_models/`; later runs reuse that cache.
-
 The active quantization settings are defined in `src/quants/config.py`:
 
 | quant type | precision |
@@ -114,7 +81,7 @@ The active quantization settings are defined in `src/quants/config.py`:
 
 Only SmoothQuant (`sq-*`) quantizes activations to 8-bit. RTN, GPTQ, and AWQ are weight-only in this repository.
 
-### Validate Results
+### Results
 
 A successful baseline run creates WAV files and a manifest below
 `outputs/evaluation/`. A quantized run also creates one directory per
