@@ -12,70 +12,95 @@ Speech-Quant therefore records both final speech quality and token-level behavio
 
 ## Setup
 
-The project uses `uv` and Python 3.12.
+Speech-Quant supports three model families: Orpheus, NeuTTS, and OuteTTS. Each
+uses a separate dependency group because their codec and quantization
+dependencies conflict.
+
+### Requirements
+
+- Linux
+- Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+- An Intel XPU runtime compatible with the pinned `torch==2.11.0+xpu` and
+	`torchaudio==2.11.0+xpu` packages
+- Network access for Hugging Face model and dataset downloads on the first run
+
+The project currently pins the XPU PyTorch index in `pyproject.toml`. It does
+not yet provide a CUDA, CPU, or other-accelerator dependency profile.
+
+### Create An Environment
+
+From the repository root, create one environment for the model you intend to
+run:
 
 ```bash
-cd Speech-Quant
-uv venv .venv-orpheus --python 3.12
-source .venv-orpheus/bin/activate
-UV_PROJECT_ENVIRONMENT=.venv-orpheus uv sync --group orpheus
+./setup-env.sh orpheus
 ```
 
-### Why Separate Environments
+Replace `orpheus` with `neutts` or `outetts` as needed. Add `--reinstall` to
+recreate an existing environment. Use `./setup-env.sh all` to prepare every
+TTS and ASR environment.
 
-The supported speech models depend on different codec packages, PyTorch builds, and `transformers` versions. Keeping separate environments avoids dependency conflicts and makes each model run reproducible.
+Verify that the selected environment has the required packages and can see the
+XPU before downloading a model:
 
-Recommended environments:
+```bash
+source .venv-orpheus/bin/activate
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
+```
 
-| environment | dependency group | intended model family |
+The final line must print `True` before running an experiment.
+
+| environment | group | model / codec |
 |---|---|---|
 | `.venv-orpheus` | `orpheus` | Orpheus / SNAC |
 | `.venv-neutts` | `neutts` | NeuTTS / NeuCodec |
 | `.venv-outetts` | `outetts` | OuteTTS / DAC |
-| `.venv-asr` | `asr` | Cohere ASR (WER/CER pass, no TTS deps) |
-
-Create another environment by changing both names:
-
-```bash
-uv venv .venv-neutts --python 3.12
-source .venv-neutts/bin/activate
-UV_PROJECT_ENVIRONMENT=.venv-neutts uv sync --group neutts
-```
-
-The `asr` group is installed differently, because `uv sync` resolves every group in the project and the transcription pass must stay independent of the quantization stack:
-
-```bash
-./setup-env.sh asr
-```
+| `.venv-asr` | `asr` | Cohere ASR for WER/CER |
 
 ## Running Experiments
 
-Run one of the model scripts after activating the matching environment:
+Activate the matching environment and use its launcher. Each launcher generates
+the full-precision baseline, runs all configured quantization variants, writes
+comparison artifacts, and then starts transcription when `.venv-asr` exists.
 
 ```bash
 source .venv-orpheus/bin/activate
 bash scripts/run_orpheus.sh
+
+source .venv-neutts/bin/activate
+bash scripts/run_neutts.sh
+
+source .venv-outetts/bin/activate
+bash scripts/run_outetts.sh
 ```
 
-The scripts compare one full-precision baseline against the configured quantization methods:
+The launchers use the following quantization variants:
 
 ```text
 rtn-4bit,rtn-8bit,gptq-4bit,gptq-8bit,awq-4bit,awq-8bit,sq-4bit,sq-8bit
 ```
 
-You can also call the evaluator directly:
+### Fast Validation Run
+
+Before launching the full 50-prompt sweep, verify one model with a single
+baseline prompt. This checks model download, XPU execution, codec decoding, and
+audio output without quantization:
 
 ```bash
 python src/evaluate.py \
 	--model orpheus \
 	--model-name canopylabs/orpheus-3b-0.1-ft \
-	--quant-type gptq-4bit,awq-4bit,sq-8bit \
+	--quant-type none \
 	--prompts-file src/prompts.txt \
-	--num-samples 50 \
+	--num-samples 1 \
 	--output-dir outputs \
-	--device xpu \
 	--seed 0
 ```
+
+For a quantization smoke test, change `--quant-type` to `rtn-8bit` and keep
+`--num-samples 1`. The first quantized run downloads calibration data and saves
+a compressed checkpoint under `quant_models/`; later runs reuse that cache.
 
 The active quantization settings are defined in `src/quants/config.py`:
 
@@ -89,13 +114,34 @@ The active quantization settings are defined in `src/quants/config.py`:
 
 Only SmoothQuant (`sq-*`) quantizes activations to 8-bit. RTN, GPTQ, and AWQ are weight-only in this repository.
 
-### WER / CER (run after the evaluation)
+### Validate Results
+
+A successful baseline run creates WAV files and a manifest below
+`outputs/evaluation/`. A quantized run also creates one directory per
+quantization type and updates:
+
+```text
+outputs/evaluation/analysis_report.xlsx
+```
+
+Inspect the workbook's `Summary`, `PerSample`, `LogProbs_KL`, and `Codec` sheets
+to compare the baseline with each quantization type. Re-running a model and
+quantization type replaces only its matching rows.
+
+### WER / CER
 
 `src/evaluate.py` leaves the WER, CER, and transcript fields blank. They are filled by a second pass that re-reads the audio already written under `outputs/`, so it never regenerates speech.
 
-Each `scripts/run_*.sh` calls this pass automatically once generation finishes, via `scripts/transcribe.sh`. If `.venv-asr` does not exist the step is skipped with a warning instead of failing the run.
+Each launcher calls this pass automatically after generation through
+`scripts/transcribe.sh`. If `.venv-asr` does not exist, the step is skipped with
+a warning. Create it before running a full experiment:
 
-It uses its own environment (`.venv-asr`) so transcription dependencies remain separate from TTS generation environments.
+```bash
+./setup-env.sh asr
+```
+
+It uses its own environment so transcription dependencies remain separate from
+TTS generation environments.
 
 To run it on its own, for every model and quantization folder found:
 
