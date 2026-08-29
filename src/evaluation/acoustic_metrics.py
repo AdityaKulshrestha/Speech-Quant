@@ -1,12 +1,12 @@
 """
 Phase 1 (Macroscopic) acoustic-distortion metrics from METRICS.md:
-Mel-Cepstral Distortion (MCD) and F0 Frame Error / Pitch Pearson Correlation
-between baseline and quantized waveforms for the same prompt.
+Mel-Cepstral Distortion (MCD), F0 Frame Error / Pitch Pearson Correlation, and
+UTMOS between baseline and quantized waveforms for the same prompt.
 
-These operate on raw audio rather than codec tokens, so they are naturally
+MCD/F0 operate on raw audio rather than codec tokens, so they are naturally
 codec-agnostic and apply the same way to Orpheus, NeuTTS, and Qwen TTS.
 
-Phase 1's other metrics (UTMOS/NISQA, SECS) are intentionally not implemented
+Phase 1's remaining metric (NISQA, SECS) is intentionally not implemented
 here; see METRICS.md.
 """
 
@@ -18,6 +18,10 @@ from typing import Any
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
+import torchaudio
+
+_utmos_predictor = None  # lazily loaded, cached across calls (torch.hub download is expensive)
 
 
 def _load_audio(path: str | Path, target_sr: int | None = None) -> tuple[np.ndarray, int]:
@@ -119,21 +123,23 @@ def pitch_pearson_correlation(
 def utmos_score(audio_path: str | Path) -> float | None:
     """Perceptual quality score via UTMOS (1=bad, 5=excellent).
 
-    Non-intrusive metric that predicts human Mean Opinion Score.
-    Returns None if UTMOS library not available.
+    Non-intrusive metric that predicts human Mean Opinion Score. Loads the
+    tarepan/SpeechMOS `utmos22_strong` model via torch.hub (there is no PyPI
+    package for this model; the `speechmos` package on PyPI is an unrelated
+    Microsoft AECMOS/DNSMOS/PLCMOS suite).
 
     Args:
         audio_path: Path to audio file
 
     Returns:
-        UTMOS score in [1, 5] range, or None if unavailable
+        UTMOS score in [1, 5] range, or None if scoring fails
     """
+    global _utmos_predictor
     try:
-        import torchaudio
-        from speechmos import MosPredictor
-
-        # Load UTMOS model (downloads checkpoint on first use)
-        predictor = MosPredictor.from_pretrained("utmos22_strong")
+        if _utmos_predictor is None:
+            _utmos_predictor = torch.hub.load(
+                "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
+            )
 
         # Load audio at 16kHz (UTMOS requirement)
         audio, sr = torchaudio.load(str(audio_path))
@@ -144,12 +150,9 @@ def utmos_score(audio_path: str | Path) -> float | None:
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
 
-        score = predictor(audio, 16000)
+        score = _utmos_predictor(audio, sr=16000)
         return float(score)
 
-    except ImportError:
-        # speechmos not installed - skip UTMOS
-        return None
     except Exception as e:
         print(f"UTMOS scoring failed: {e}")
         return None

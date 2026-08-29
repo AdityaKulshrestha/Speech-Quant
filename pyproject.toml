@@ -15,7 +15,7 @@ base = [
     "accelerate>=0.30",
     "soundfile>=0.12",
     "librosa>=0.10.0",  # acoustic metrics (MCD, F0)
-    "speechmos>=0.0.1",  # perceptual quality (UTMOS)
+    # UTMOS (perceptual quality) loads tarepan/SpeechMOS via torch.hub, not pip
     # numpy version specified per-model due to llmcompressor/neucodec conflicts
     "matplotlib>=3.7",
     "pandas>=2.0",
@@ -66,7 +66,7 @@ qwen-tts = [
     "soundfile>=0.12",
     "numpy>=2.0.0,<=2.3.5",  # llmcompressor 0.9.x requirement
     "librosa>=0.10.0",  # acoustic metrics (MCD, F0)
-    "speechmos>=0.0.1",  # perceptual quality (UTMOS)
+    # UTMOS (perceptual quality) loads tarepan/SpeechMOS via torch.hub, not pip
     "matplotlib>=3.7",
     "pandas>=2.0",
     "openpyxl>=3.1",
