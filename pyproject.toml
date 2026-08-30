@@ -35,6 +35,7 @@ orpheus = [
     "huggingface-hub>=1.5.0",
     "pyarrow>=21.0.0",
     "snac>=1.2.1",
+    "utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git",
     # Not in `base`: gptqmodel>=7 requires torchao>=0.16, which neutts cannot take.
     "gptqmodel>=7.0.0",
     "optimum==2.2.0",
@@ -50,6 +51,7 @@ neutts = [
     "huggingface-hub>=1.5.0",
     "pyarrow>=21.0.0",
     "neucodec>=0.0.6",
+    "utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git",
     "torchao==0.13.0",
     "torchtune==0.5.0",
     "vector-quantize-pytorch==1.17.8",
@@ -65,13 +67,13 @@ outetts = [
     "huggingface-hub>=1.5.0",
     "pyarrow>=21.0.0",
     "descript-audio-codec>=1.0",
+    "utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git",
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
-# ASR: Unified evaluation over already-generated audio (src/evaluate_unified.py).
+# ASR: Transcription (WER/CER) over already-generated audio (src/evaluate_transcription.py).
 # Standalone on purpose -- it does not include `base`, so it needs no quantization
-# stack and stays resolvable independently. Runs transcription (WER/CER) + UTMOS
-# scoring on audio from all TTS models. Install with `uv pip install --group asr`
+# stack and stays resolvable independently. Install with `uv pip install --group asr`
 # (not `uv sync`, which would resolve every other group too).
 asr = [
     "torch==2.11.0",
@@ -83,7 +85,6 @@ asr = [
     "protobuf>=4.25",
     "soundfile>=0.12",
     "librosa>=0.10.0",
-    "utmosv2>=1.0.0",  # UTMOS perceptual quality scoring
     "numpy>=1.26",
     "pandas>=2.0",
     "openpyxl>=3.1",

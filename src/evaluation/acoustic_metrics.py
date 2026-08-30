@@ -23,7 +23,14 @@ import torchaudio
 import utmosv2
 
 _utmos_model = None  # lazily loaded, cached across calls (checkpoint download is expensive)
-_utmos_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Auto-detect available device (cuda, xpu, or cpu)
+if torch.cuda.is_available():
+    _utmos_device = "cuda:0"
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    _utmos_device = "xpu:0"
+else:
+    _utmos_device = "cpu"
 
 
 def _load_audio(path: str | Path, target_sr: int | None = None) -> tuple[np.ndarray, int]:
@@ -125,9 +132,6 @@ def pitch_pearson_correlation(
 def utmos_score(audio_path: str | Path) -> float | None:
     """Perceptual quality score via UTMOSv2 (1=bad, 5=excellent).
 
-    Non-intrusive metric that predicts human Mean Opinion Score, using the
-    `utmosv2` PyPI package (sarulab-speech/UTMOSv2 fusion_stage3 checkpoint).
-
     Args:
         audio_path: Path to audio file
 
@@ -143,7 +147,6 @@ def utmos_score(audio_path: str | Path) -> float | None:
             input_path=str(audio_path), device=_utmos_device, verbose=False
         )
         return float(score)
-
     except Exception as e:
         print(f"UTMOS scoring failed: {e}")
         return None
@@ -198,44 +201,9 @@ def summarize_acoustics(per_sample: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def evaluate_utmos_run(manifest: list[dict]) -> dict[str, Any]:
-    """Compute UTMOS scores for all audio files in a manifest.
-
-    Args:
-        manifest: List of manifest entries with 'audio_path' keys
-
-    Returns:
-        Dict with:
-            - samples: List of per-sample results
-            - mean_utmos: Average UTMOS score
-    """
-    results = []
-    scores = []
-
-    for entry in manifest:
-        audio_path = entry.get("audio_path")
-        if not audio_path or not Path(audio_path).exists():
-            continue
-
-        score = utmos_score(audio_path)
-        if score is not None:
-            results.append({
-                "sample_id": entry.get("sample_id"),
-                "utmos": score,
-            })
-            scores.append(score)
-
-    return {
-        "samples": results,
-        "mean_utmos": float(np.mean(scores)) if scores else None,
-        "num_samples": len(scores),
-    }
-
-
 __all__ = [
     "compare_acoustics",
     "compare_acoustics_manifest",
-    "evaluate_utmos_run",
     "extract_f0",
     "f0_frame_error",
     "mel_cepstral_distortion",
