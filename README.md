@@ -59,15 +59,15 @@ GPTQModel, which requires a newer `torchao`; NeuTTS pins `torchao==0.13.0` for
 NeuCodec; and OuteTTS brings DAC dependencies with a different protobuf
 constraint. The separate environments keep each model's codec and
 quantization stack reproducible instead of resolving one model by breaking
-another. The ASR environment is also isolated because it is used only after
-audio generation for WER and CER scoring.
+another. The ASR environment is isolated for unified evaluation (transcription + UTMOS)
+on pre-generated audio from all models.
 
-| environment | group | model / codec |
+| environment | group | purpose |
 |---|---|---|
-| `.venv-orpheus` | `orpheus` | Orpheus / SNAC |
-| `.venv-neutts` | `neutts` | NeuTTS / NeuCodec |
-| `.venv-outetts` | `outetts` | OuteTTS / DAC |
-| `.venv-asr` | `asr` | Cohere ASR for WER/CER |
+| `.venv-orpheus` | `orpheus` | Orpheus generation + quantization |
+| `.venv-neutts` | `neutts` | NeuTTS generation + quantization |
+| `.venv-outetts` | `outetts` | OuteTTS generation + quantization |
+| `.venv-asr` | `asr` | Unified evaluation: WER/CER + UTMOS (all models) |
 
 ## Running Experiments
 
@@ -120,41 +120,63 @@ Inspect the workbook's `Summary`, `PerSample`, `LogProbs_KL`, and `Codec` sheets
 to compare the baseline with each quantization type. Re-running a model and
 quantization type replaces only its matching rows.
 
-### WER / CER
+### Unified Evaluation (WER/CER + UTMOS)
 
-`src/evaluate.py` leaves the WER, CER, and transcript fields blank. They are filled by a second pass that re-reads the audio already written under `outputs/`, so it never regenerates speech.
+`src/evaluate.py` leaves the WER, CER, transcript, and UTMOS fields blank. These are filled by a **unified evaluation pass** that runs in the ASR environment and processes pre-generated audio from all models.
 
-Each launcher calls this pass automatically after generation through
-`scripts/transcribe.sh`. If `.venv-asr` does not exist, the step is skipped with
-a warning. Create it before running a full experiment:
+**Benefits of this approach:**
+- ✅ Single environment for all evaluation (no dependency conflicts)
+- ✅ Works with audio from Orpheus, NeuTTS, and OuteTTS
+- ✅ Runs transcription + UTMOS scoring together
+- ✅ Never regenerates audio
+
+**Setup:**
+
+Create the ASR environment (includes transcription + UTMOS dependencies):
 
 ```bash
 ./setup-env.sh asr
 ```
 
-It uses its own environment so transcription dependencies remain separate from
-TTS generation environments.
+**Running Unified Evaluation:**
 
-To run it on its own, for every model and quantization folder found:
-
-```bash
-PYTHONPATH=src .venv-asr/bin/python src/evaluate_transcription.py \
-	--audio-root outputs/evaluation \
-	--quant-type all \
-	--batch-size 8
-```
-
-Or narrow the scope to one model directory:
+For all models and quants:
 
 ```bash
-PYTHONPATH=src .venv-asr/bin/python src/evaluate_transcription.py \
-	--audio-root outputs/evaluation/orpheus-3b-0.1-ft \
-	--quant-type gptq-4bit,awq-4bit
+export HF_TOKEN="your_huggingface_token"  # Required for Cohere ASR
+source .venv-asr/bin/activate
+PYTHONPATH=src python src/evaluate_unified.py \
+    --audio-root outputs/evaluation \
+    --batch-size 8
 ```
 
-Before scoring, both the ground-truth prompt and the ASR transcript are normalized: numbers and dates are expanded to spoken form via NeMo, punctuation is stripped, apostrophes are removed so `can't` and `cant` match, and the text is lowercased and whitespace-collapsed. Punctuation and casing therefore never count as errors.
+For a specific model:
 
-The pass only rewrites the WER/CER, transcript, and delta columns for the matching `(model, quant_type)`; all other sheets and rows are preserved. Writes take an exclusive lock on the workbook, so this is safe to run while other jobs are queued. Raise `--batch-size` on an accelerator node — transcription is batched through a single `generate()` call per chunk.
+```bash
+PYTHONPATH=src python src/evaluate_unified.py \
+    --audio-root outputs/evaluation/orpheus-3b-0.1-ft \
+    --quant-type gptq-4bit,awq-4bit
+```
+
+Skip UTMOS (transcription only):
+
+```bash
+PYTHONPATH=src python src/evaluate_unified.py \
+    --audio-root outputs/evaluation \
+    --skip-utmos
+```
+
+**How it works:**
+
+1. Loads Cohere ASR model once
+2. Processes each model's baseline + quant directories
+3. Runs batch transcription (WER/CER) on all audio files
+4. Computes UTMOS perceptual quality scores
+5. Updates `analysis_report.xlsx` with all metrics
+
+Text normalization: Ground-truth prompts and ASR transcripts are normalized (numbers/dates expanded via NeMo, punctuation stripped, apostrophes removed, lowercased) so punctuation and casing never count as errors.
+
+The script only updates WER/CER/transcript/UTMOS columns for matching `(model, quant_type)` rows; all other data is preserved. Writes use an exclusive lock, so it's safe to run concurrently.
 
 ## Outputs
 

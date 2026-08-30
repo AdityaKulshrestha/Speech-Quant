@@ -219,61 +219,94 @@ def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
 
 
 def evaluate_transcription_run(
-    run_dir: Path,
-    prompts: Sequence[str],
-    asr_model: Any,
-    processor,
-    batch_size: int,
+    manifest: Sequence[dict] | None = None,
+    processor: Any | None = None,
+    model: Any | None = None,
+    batch_size: int = 8,
     sampling_rate: int = DEFAULT_SAMPLE_RATE,
     language: str = "en",
+    # Legacy parameters (deprecated, use manifest instead)
+    run_dir: Path | None = None,
+    prompts: Sequence[str] | None = None,
+    asr_model: Any | None = None,
 ) -> dict:
-    """Evaluate one audio run against the prompt list and return aggregate WER/CER metrics."""
-    audio_files = find_audio_files(run_dir)
-    if not audio_files:
-        raise FileNotFoundError(f"No audio files found under {run_dir}")
+    """Evaluate audio files and return WER/CER metrics.
 
-    n_allowed = min(len(prompts), len(audio_files))
-    selected_files = audio_files[:n_allowed]
+    Args:
+        manifest: List of manifest entries with 'audio_path' and 'text' keys
+        processor: HuggingFace processor (required if manifest is provided)
+        model: ASR model (required if manifest is provided)
+        batch_size: Batch size for transcription
+        sampling_rate: Target sampling rate
+        language: Language code
+        run_dir: (Legacy) Directory with audio files
+        prompts: (Legacy) List of ground-truth prompts
+        asr_model: (Legacy) ASR model
+
+    Returns:
+        Dict with samples (per-sample results) and aggregates (mean_wer, mean_cer)
+    """
+    # Handle legacy signature
+    if run_dir is not None and prompts is not None:
+        # Legacy mode: use run_dir + prompts
+        audio_files = find_audio_files(run_dir)
+        if not audio_files:
+            raise FileNotFoundError(f"No audio files found under {run_dir}")
+
+        n_allowed = min(len(prompts), len(audio_files))
+        selected_files = audio_files[:n_allowed]
+        selected_prompts = prompts[:n_allowed]
+        used_model = asr_model if asr_model is not None else model
+        used_processor = processor
+    else:
+        # New mode: use manifest
+        if manifest is None or processor is None or model is None:
+            raise ValueError("Must provide manifest, processor, and model")
+
+        selected_files = [Path(entry["audio_path"]) for entry in manifest]
+        selected_prompts = [entry["text"] for entry in manifest]
+        n_allowed = len(selected_files)
+        used_model = model
+        used_processor = processor
+
+    # Transcribe
     transcripts = transcribe_batch(
-        asr_model,
-        processor,
+        used_model,
+        used_processor,
         selected_files,
         batch_size=batch_size,
         sampling_rate=sampling_rate,
         language=language,
     )
-    if len(transcripts) != n_allowed:
-        raise ValueError(
-            f"Expected {n_allowed} transcripts for {run_dir}, got {len(transcripts)}."
-        )
 
+    if len(transcripts) != n_allowed:
+        raise ValueError(f"Expected {n_allowed} transcripts, got {len(transcripts)}")
+
+    # Compute WER/CER
     entries = []
     wer_values = []
     cer_values = []
-    for prompt, transcript in zip(prompts[:n_allowed], transcripts):
+    for i, (prompt, transcript) in enumerate(zip(selected_prompts, transcripts)):
         norm_prompt = normalize_text(prompt)
         norm_transcript = normalize_text(transcript)
         wer = word_error_rate_normalized(norm_prompt, norm_transcript)
         cer = character_error_rate_normalized(norm_prompt, norm_transcript)
         wer_values.append(wer)
         cer_values.append(cer)
-        entries.append(
-            {
-                "prompt": prompt,
-                "transcript": transcript,
-                "prompt_normalized": norm_prompt,
-                "transcript_normalized": norm_transcript,
-                "wer": wer,
-                "cer": cer,
-            }
-        )
+        entries.append({
+            "sample_id": manifest[i]["sample_id"] if manifest else f"sample_{i:03d}",
+            "prompt": prompt,
+            "transcript": transcript,
+            "prompt_normalized": norm_prompt,
+            "transcript_normalized": norm_transcript,
+            "wer": wer,
+            "cer": cer,
+        })
 
     return {
-        "run": run_dir.name,
         "num_samples": n_allowed,
         "mean_wer": sum(wer_values) / len(wer_values) if wer_values else 0.0,
         "mean_cer": sum(cer_values) / len(cer_values) if cer_values else 0.0,
-        "transcripts": transcripts,
         "samples": entries,
     }
 

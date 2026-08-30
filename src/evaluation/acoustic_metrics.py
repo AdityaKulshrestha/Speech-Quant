@@ -198,9 +198,44 @@ def summarize_acoustics(per_sample: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def evaluate_utmos_run(manifest: list[dict]) -> dict[str, Any]:
+    """Compute UTMOS scores for all audio files in a manifest.
+
+    Args:
+        manifest: List of manifest entries with 'audio_path' keys
+
+    Returns:
+        Dict with:
+            - samples: List of per-sample results
+            - mean_utmos: Average UTMOS score
+    """
+    results = []
+    scores = []
+
+    for entry in manifest:
+        audio_path = entry.get("audio_path")
+        if not audio_path or not Path(audio_path).exists():
+            continue
+
+        score = utmos_score(audio_path)
+        if score is not None:
+            results.append({
+                "sample_id": entry.get("sample_id"),
+                "utmos": score,
+            })
+            scores.append(score)
+
+    return {
+        "samples": results,
+        "mean_utmos": float(np.mean(scores)) if scores else None,
+        "num_samples": len(scores),
+    }
+
+
 __all__ = [
     "compare_acoustics",
     "compare_acoustics_manifest",
+    "evaluate_utmos_run",
     "extract_f0",
     "f0_frame_error",
     "mel_cepstral_distortion",

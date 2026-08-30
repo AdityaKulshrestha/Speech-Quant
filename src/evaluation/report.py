@@ -610,4 +610,137 @@ def update_transcription_report(
         _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
 
 
-__all__ = ["update_report", "update_transcription_report"]
+def update_transcription_and_utmos_report(
+    report_path: Path,
+    model: str,
+    quant_type: str,
+    transcription_results: dict | None = None,
+    utmos_results: dict | None = None,
+) -> None:
+    """Update report with transcription (WER/CER) and/or UTMOS results.
+
+    This is the unified evaluation entry point that can update:
+    - Transcription metrics (WER/CER) if transcription_results provided
+    - UTMOS scores if utmos_results provided
+    - Both if both provided
+
+    Args:
+        report_path: Path to analysis_report.xlsx
+        model: Model name (e.g., "canopylabs/orpheus-3b-0.1-ft")
+        quant_type: Quantization type or "baseline"
+        transcription_results: Results from evaluate_transcription_run()
+        utmos_results: Results from evaluate_utmos_run()
+    """
+    with _lock_workbook(report_path):
+        summary_long, per_sample, logprobs_kl, codec = _load_workbook(report_path)
+
+        if per_sample.empty:
+            raise ValueError(f"{report_path} has no {PER_SAMPLE_SHEET!r} rows to update.")
+
+        mask = (per_sample["model"] == model) & (per_sample["quant_type"] == quant_type)
+        row_indices = list(per_sample.index[mask])
+
+        if not row_indices:
+            raise ValueError(
+                f"No rows found for model={model!r}, quant_type={quant_type!r} in {PER_SAMPLE_SHEET!r}"
+            )
+
+        updates: dict[str, Any] = {}
+
+        # Add transcription updates if provided
+        if transcription_results:
+            trans_samples = transcription_results.get("samples", [])
+
+            def column(samples: list[dict], key: str) -> list[Any]:
+                return [samples[i].get(key) if i < len(samples) else None for i in range(len(row_indices))]
+
+            if quant_type == "baseline":
+                # Baseline: only baseline columns
+                updates.update({
+                    "baseline_transcript": column(trans_samples, "transcript"),
+                    "ground_truth_normalized": column(trans_samples, "prompt_normalized"),
+                    "baseline_transcript_normalized": column(trans_samples, "transcript_normalized"),
+                    "baseline_wer": column(trans_samples, "wer"),
+                    "baseline_cer": column(trans_samples, "cer"),
+                })
+            else:
+                # Quant: quant columns + delta
+                baseline_wer = per_sample.loc[row_indices, "baseline_wer"].tolist()
+                baseline_cer = per_sample.loc[row_indices, "baseline_cer"].tolist()
+                quant_wer = column(trans_samples, "wer")
+                quant_cer = column(trans_samples, "cer")
+
+                def delta(baseline: list, quant: list) -> list:
+                    return [q - b if b is not None and q is not None else None
+                            for b, q in zip(baseline, quant)]
+
+                updates.update({
+                    "quant_transcript": column(trans_samples, "transcript"),
+                    "quant_transcript_normalized": column(trans_samples, "transcript_normalized"),
+                    "quant_wer": quant_wer,
+                    "quant_cer": quant_cer,
+                    "wer_delta_vs_baseline": delta(baseline_wer, quant_wer),
+                    "cer_delta_vs_baseline": delta(baseline_cer, quant_cer),
+                })
+
+        # Add UTMOS updates if provided
+        if utmos_results:
+            utmos_samples = utmos_results.get("samples", [])
+
+            def column_utmos(samples: list[dict], key: str) -> list[Any]:
+                return [samples[i].get(key) if i < len(samples) else None for i in range(len(row_indices))]
+
+            if quant_type == "baseline":
+                updates["utmos_baseline"] = column_utmos(utmos_samples, "utmos")
+            else:
+                updates["utmos_quant"] = column_utmos(utmos_samples, "utmos")
+
+        # Apply all updates
+        for name, values in updates.items():
+            # Handle dtype conversion for string columns
+            per_sample[name] = (
+                per_sample[name].astype(object)
+                if name in per_sample.columns
+                else pd.Series(index=per_sample.index, dtype=object)
+            )
+            per_sample.loc[row_indices, name] = values
+
+        # Update summary metrics
+        new_summary_rows = []
+        if transcription_results and quant_type != "baseline":
+            mean_wer = transcription_results.get("mean_wer")
+            mean_cer = transcription_results.get("mean_cer")
+            if mean_wer is not None:
+                new_summary_rows.append({"metric": "quant_wer", "model": model, "quant_type": quant_type, "value": mean_wer})
+            if mean_cer is not None:
+                new_summary_rows.append({"metric": "quant_cer", "model": model, "quant_type": quant_type, "value": mean_cer})
+        elif transcription_results and quant_type == "baseline":
+            mean_wer = transcription_results.get("mean_wer")
+            mean_cer = transcription_results.get("mean_cer")
+            if mean_wer is not None:
+                new_summary_rows.append({"metric": "baseline_wer", "model": model, "quant_type": quant_type, "value": mean_wer})
+            if mean_cer is not None:
+                new_summary_rows.append({"metric": "baseline_cer", "model": model, "quant_type": quant_type, "value": mean_cer})
+
+        if utmos_results:
+            mean_utmos = utmos_results.get("mean_utmos")
+            if mean_utmos is not None:
+                metric_name = "mean_utmos_baseline" if quant_type == "baseline" else "mean_utmos_quant"
+                new_summary_rows.append({"metric": metric_name, "model": model, "quant_type": quant_type, "value": mean_utmos})
+
+        if new_summary_rows:
+            new_summary_df = pd.DataFrame(new_summary_rows)
+            metric_names = [row["metric"] for row in new_summary_rows]
+            if not summary_long.empty:
+                mask = (
+                    (summary_long["model"] == model)
+                    & (summary_long["quant_type"] == quant_type)
+                    & (summary_long["metric"].isin(metric_names))
+                )
+                summary_long = summary_long.loc[~mask]
+            summary_long = pd.concat([summary_long, new_summary_df], ignore_index=True)
+
+        _write_workbook(report_path, summary_long, per_sample, logprobs_kl, codec)
+
+
+__all__ = ["update_report", "update_transcription_report", "update_transcription_and_utmos_report"]

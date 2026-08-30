@@ -68,9 +68,10 @@ outetts = [
     "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git",
 ]
 
-# ASR: WER/CER pass over already-generated audio (src/evaluate_transcription.py).
+# ASR: Unified evaluation over already-generated audio (src/evaluate_unified.py).
 # Standalone on purpose -- it does not include `base`, so it needs no quantization
-# stack and stays resolvable independently. Install with `uv pip install --group asr`
+# stack and stays resolvable independently. Runs transcription (WER/CER) + UTMOS
+# scoring on audio from all TTS models. Install with `uv pip install --group asr`
 # (not `uv sync`, which would resolve every other group too).
 asr = [
     "torch==2.11.0",
@@ -82,6 +83,7 @@ asr = [
     "protobuf>=4.25",
     "soundfile>=0.12",
     "librosa>=0.10.0",
+    "utmosv2>=1.0.0",  # UTMOS perceptual quality scoring
     "numpy>=1.26",
     "pandas>=2.0",
     "openpyxl>=3.1",

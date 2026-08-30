@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
-# WER/CER pass over audio already written by src/evaluate.py -- no speech is regenerated.
-# Runs in its own env (./setup-env.sh asr) to keep Cohere ASR's dependency stack
-# isolated from the TTS model environments.
+# Run unified evaluation (transcription + UTMOS) over pre-generated audio.
+# This is called by model-specific launchers after audio generation completes.
 #
-# Usage: scripts/transcribe.sh [audio-root] [quant-types]
+# Runs in the ASR environment (.venv-asr) which is isolated from TTS dependencies
+# and can process audio from all models (Orpheus, NeuTTS, OuteTTS).
+#
+# Usage: scripts/transcribe.sh <model-dir>
+# Example: scripts/transcribe.sh outputs/evaluation/orpheus-3b-0.1-ft
 set -euo pipefail
 
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <model-dir>" >&2
+    echo "Example: $0 outputs/evaluation/orpheus-3b-0.1-ft" >&2
+    exit 1
+fi
+
+MODEL_DIR="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-AUDIO_ROOT="${1:-$REPO_ROOT/outputs/evaluation}"
-QUANT_TYPES="${2:-all}"
-ASR_PYTHON="$REPO_ROOT/.venv-asr/bin/python"
-
-if [ ! -x "$ASR_PYTHON" ]; then
-    echo "WER/CER skipped: $ASR_PYTHON not found. Create it with: ./setup-env.sh asr" >&2
+if [ ! -d "$REPO_ROOT/.venv-asr" ]; then
+    echo "Warning: .venv-asr not found. Skipping unified evaluation." >&2
+    echo "  Create it with: ./setup-env.sh asr" >&2
     exit 0
 fi
 
-PYTHONPATH="$REPO_ROOT/src" "$ASR_PYTHON" "$REPO_ROOT/src/evaluate_transcription.py" \
-    --audio-root "$AUDIO_ROOT" \
-    --quant-type "$QUANT_TYPES" \
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "Warning: HF_TOKEN not set. Skipping transcription (UTMOS will still run)." >&2
+    echo "  Set HF_TOKEN to enable Cohere ASR transcription." >&2
+fi
+
+cd "$REPO_ROOT"
+export PYTHONPATH=src
+
+echo "Running unified evaluation (transcription + UTMOS) for $MODEL_DIR..."
+.venv-asr/bin/python src/evaluate_unified.py \
+    --audio-root "$MODEL_DIR" \
+    --quant-type all \
     --batch-size 8
+
+echo "Unified evaluation complete."
