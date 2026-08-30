@@ -20,8 +20,10 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
+import utmosv2
 
-_utmos_predictor = None  # lazily loaded, cached across calls (torch.hub download is expensive)
+_utmos_model = None  # lazily loaded, cached across calls (checkpoint download is expensive)
+_utmos_device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def _load_audio(path: str | Path, target_sr: int | None = None) -> tuple[np.ndarray, int]:
@@ -121,12 +123,10 @@ def pitch_pearson_correlation(
 
 
 def utmos_score(audio_path: str | Path) -> float | None:
-    """Perceptual quality score via UTMOS (1=bad, 5=excellent).
+    """Perceptual quality score via UTMOSv2 (1=bad, 5=excellent).
 
-    Non-intrusive metric that predicts human Mean Opinion Score. Loads the
-    tarepan/SpeechMOS `utmos22_strong` model via torch.hub (there is no PyPI
-    package for this model; the `speechmos` package on PyPI is an unrelated
-    Microsoft AECMOS/DNSMOS/PLCMOS suite).
+    Non-intrusive metric that predicts human Mean Opinion Score, using the
+    `utmosv2` PyPI package (sarulab-speech/UTMOSv2 fusion_stage3 checkpoint).
 
     Args:
         audio_path: Path to audio file
@@ -134,20 +134,14 @@ def utmos_score(audio_path: str | Path) -> float | None:
     Returns:
         UTMOS score in [1, 5] range, or None if scoring fails
     """
-    global _utmos_predictor
+    global _utmos_model
     try:
-        if _utmos_predictor is None:
-            _utmos_predictor = torch.hub.load(
-                "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
-            )
+        if _utmos_model is None:
+            _utmos_model = utmosv2.create_model(pretrained=True)
 
-        # Load audio at 16kHz (UTMOS requirement) using soundfile instead of torchaudio
-        audio_np, sr = _load_audio(audio_path, target_sr=16000)
-
-        # Convert numpy array to torch tensor [1, samples] for UTMOS model
-        audio = torch.from_numpy(audio_np).unsqueeze(0)
-
-        score = _utmos_predictor(audio, sr=16000)
+        score = _utmos_model.predict(
+            input_path=str(audio_path), device=_utmos_device, verbose=False
+        )
         return float(score)
 
     except Exception as e:

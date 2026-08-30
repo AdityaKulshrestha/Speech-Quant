@@ -15,6 +15,7 @@ base = [
     "accelerate>=0.30",
     "soundfile>=0.12",
     "librosa>=0.10.0",  # acoustic metrics (MCD, F0)
+    "utmosv2>=1.0.0",  # acoustic metrics (UTMOS MOS prediction)
     "matplotlib>=3.7",
     "pandas>=2.0",
     "openpyxl>=3.1",  # consolidated analysis_report.xlsx

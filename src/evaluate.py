@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="xpu",
+        default="cuda",
         help="Device to run inference on.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=1200)

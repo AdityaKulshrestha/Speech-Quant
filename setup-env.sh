@@ -24,7 +24,7 @@ show_help() {
 Usage: ./setup-env.sh [MODEL] [--reinstall]
 
 Create a uv environment and install dependencies for a specific model.
-Set DEVICE=cpu, DEVICE=cuda, or DEVICE=xpu to select the PyTorch backend.
+Set DEVICE to select the PyTorch backend (default: auto).
 
 Available models:
   orpheus   - Orpheus (transformers 5.15+, llmcompressor dev, torch 2.11.0)
@@ -37,9 +37,9 @@ Flags:
   --reinstall    Delete existing environment before creating
 
 Examples:
-    DEVICE=xpu ./setup-env.sh orpheus              # Create/sync .venv-orpheus
+    ./setup-env.sh orpheus                         # Create/sync .venv-orpheus (auto-detect)
     DEVICE=cpu ./setup-env.sh orpheus --reinstall  # Recreate on CPU
-    DEVICE=cuda ./setup-env.sh all                 # Create all environments
+    DEVICE=cuda ./setup-env.sh all                 # Create all environments with CUDA
 
 Note: Requires --index-strategy unsafe-best-match for package resolution.
 

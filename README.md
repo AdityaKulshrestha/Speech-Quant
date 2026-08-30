@@ -86,8 +86,7 @@ source .venv-outetts/bin/activate
 bash scripts/run_outetts.sh <device>
 ```
 
-Pass the device supported by the active PyTorch environment, such as `cpu`,
-`cuda`, or `xpu`.
+Pass the device supported by your PyTorch installation, such as `cpu` or `cuda`.
 
 The launchers use the following quantization variants:
 

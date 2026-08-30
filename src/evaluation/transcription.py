@@ -198,10 +198,8 @@ def transcribe_batch(
 def load_asr_model(model_name: str = DEFAULT_MODEL, device_map: str = "auto"):
     """Load the Cohere ASR processor/model pair for WER/CER evaluation.
 
-    HF/accelerate's device_map="auto" dispatch doesn't reliably detect Intel XPU and
-    silently falls back to CPU (dramatically slower for a model this size), so pin an
-    available accelerator explicitly instead — same {"": device} workaround already
-    used in quants/quantizer.py for the same reason.
+    This explicitly checks device availability and sets device_map accordingly,
+    ensuring compatibility with various accelerators (CUDA, XPU, CPU).
     """
     if device_map == "auto":
         if torch.xpu.is_available():
